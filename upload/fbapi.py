@@ -6,7 +6,7 @@ import logging
 import itertools
 import numpy as np
 import pandas as pd
-import upload.utils as utl
+import uploader.upload.utils as utl
 from facebook_business.adobjects.ad import Ad
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adset import AdSet

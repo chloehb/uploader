@@ -5,7 +5,7 @@ import json
 import logging
 import requests
 import pandas as pd
-import upload.utils as utl
+import uploader.upload.utils as utl
 
 szk_path = 'szk'
 config_path = os.path.join(utl.config_file_path, szk_path)

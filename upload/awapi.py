@@ -6,7 +6,7 @@ import uuid
 import logging
 import numpy as np
 import pandas as pd
-import upload.utils as utl
+import uploader.upload.utils as utl
 # from googleads import adwords
 
 aw_path = 'aw'
