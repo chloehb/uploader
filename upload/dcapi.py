@@ -33,6 +33,7 @@ class DcApi(object):
         self.site_dict = {}
         self.cam_dict = {}
         self.place_dict = {}
+        self.tag_dict = {}
         self.ad_dict = {}
         self.directory_site_dict = {}
         self.df = pd.DataFrame()
@@ -107,7 +108,8 @@ class DcApi(object):
         return id_list
 
     def get_id_dict(self, entity=None, parent=None, fields=None, nest=None,
-                    resp_entity=None, request_filter=None):
+                    resp_entity=None, request_filter=None,
+                    request_method='get'):
         url = self.create_url(entity)
         id_dict = {}
         if request_filter:
@@ -119,11 +121,10 @@ class DcApi(object):
         while next_page:
             if next_page_token:
                 params['pageToken'] = next_page_token
-            r = self.make_request(url, method='get', params=params)
-            id_dict = self.get_dict_from_page(id_dict, r.json(),
-                                              list(parent.values())[0],
-                                              list(fields.values()), nest,
-                                              resp_entity)
+            r = self.make_request(url, method=request_method, params=params)
+            id_dict = self.get_dict_from_page(
+                id_dict=id_dict, page=r.json(), parent=list(parent.values())[0],
+                fields=list(fields.values()), nest=nest, entity=resp_entity)
             if 'nextPageToken' in r.json():
                 next_page_token = r.json()['nextPageToken']
             else:
@@ -136,12 +137,23 @@ class DcApi(object):
         resp_fields = [parent]
         if fields:
             resp_fields += fields
-        id_dict.update({x[nest]['id'] if nest else x['id']:
-                       {'parent' if y == parent else y.replace('.', ''):
-                        x[nest][y] if nest and y in x[nest] else x[y]
-                        for y in resp_fields
-                        if y in x or (nest and y in x[nest])}
-                        for x in page[entity] if entity})
+        if entity and entity in page:
+            for x in page[entity]:
+                if nest:
+                    if entity == 'placementTags':
+                        if nest not in x:
+                            x[nest] = [{}]
+                        x[nest] = x[nest][0]
+                        x[nest]['id'] = x[parent]
+                    x = x[nest]
+                new_dict = {}
+                new_key = x['id']
+                for y in resp_fields:
+                    dict_key = 'parent' if y == parent else y.replace('.', '')
+                    if y in x:
+                        dict_val = x[y]
+                        new_dict[dict_key] = dict_val
+                id_dict.update({new_key: new_dict})
         return id_dict
 
     def get_lp_id_dict(self):
@@ -166,6 +178,17 @@ class DcApi(object):
         place_dict = self.get_id_dict(entity='placements', parent=parent,
                                       fields=fields, resp_entity='placements',
                                       request_filter=request_filter)
+        return place_dict
+
+    def get_tag_id_dict(self, campaign_id):
+        parent = {'placementId': 'placementId'}
+        fields = {'clickTag': 'clickTag'}
+        request_filter = {'campaignId': campaign_id}
+        entity = 'placements/generatetags'
+        place_dict = self.get_id_dict(
+            entity=entity, parent=parent, fields=fields, nest='tagDatas',
+            resp_entity='placementTags', request_filter=request_filter,
+            request_method='post')
         return place_dict
 
     def get_site_id_dict(self):
@@ -197,6 +220,8 @@ class DcApi(object):
         if dcm_object == 'directorySites':
             self.directory_site_dict = self.get_directory_site_id_dict(
                 filter_id)
+        if dcm_object == 'tags':
+            self.tag_dict = self.get_tag_id_dict(filter_id)
 
     def create_entity(self, entity, entity_name=''):
         url = self.create_url(entity_name)
@@ -432,6 +457,21 @@ class PlacementUpload(object):
     def upload_placement(api, placement):
         if not placement.check_exists(api):
             api.create_entity(placement, entity_name='placements')
+
+    @staticmethod
+    def generate_dcm_tags(api, campaign_id):
+        """
+        Grabs tags for placements with the specified campaign_id.  Returns as
+        a dictionary.
+
+        https://developers.google.com/doubleclick-advertisers/rest/v4/placements/generatetags # noqa
+
+        :param api: instance of authenticated DcApi
+        :param campaign_id: id of the campaign to pull placements for
+        :return: api.tag_dict dictionary with tags and placement ids
+        """
+        api.set_id_dict(dcm_object='tags', filter_id=campaign_id)
+        return api.tag_dict
 
 
 class Placement(object):
