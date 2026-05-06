@@ -328,6 +328,12 @@ class Campaign(object):
         if not self.advertiserId:
             logging.warning('{} needs advertiserId'.format(self.name))
             return {}
+        if not self.defaultLandingPageId:
+            logging.warning(
+                '{} has no defaultLandingPageId; skipping upload. '
+                'Set defaultLandingPage on the campaign row.'.format(
+                    self.name))
+            return {}
         cam_dict = {
             'name': '{}'.format(self.name),
             'archived': '{}'.format('false'),
@@ -340,6 +346,12 @@ class Campaign(object):
         return cam_dict
 
     def get_landing_page_id(self, api):
+        if not self.defaultLandingPage:
+            logging.warning(
+                '{} has no defaultLandingPage; cannot resolve a '
+                'landing page id. Campaign will be skipped.'.format(
+                    self.name))
+            return
         lp = LandingPage({'name': self.defaultLandingPage,
                           'advertiserId': self.advertiserId,
                           'url': self.defaultLandingPage}, api=api)
@@ -387,6 +399,12 @@ class LandingPage(object):
         return lp_dict
 
     def get_landing_page_id(self, api):
+        if not self.name or not self.url:
+            logging.warning(
+                'Landing page is missing name or url '
+                '(name={!r}, url={!r}); cannot look up or create.'.format(
+                    self.name, self.url))
+            return
         if not api.lp_dict:
             api.set_id_dict('landing_page')
         lp_ids = api.get_id(api.lp_dict, self.name,
@@ -400,7 +418,13 @@ class LandingPage(object):
     def upload(self, api):
         logging.info('Uploading landing page with {}'.format(self.upload_dict))
         r = api.create_entity(self, entity_name='advertiserLandingPages')
-        self.id = r.json()['id']
+        resp = r.json()
+        if 'id' in resp:
+            self.id = resp['id']
+        else:
+            logging.warning(
+                'Landing page upload did not return an id for '
+                '{!r}. DCM response: {}'.format(self.name, resp))
 
 
 class PlacementUpload(object):
@@ -513,13 +537,18 @@ class Placement(object):
             self.upload_dict = self.create_p_dict()
 
     def create_p_dict(self):
+        if self.campaignId:
+            cid = int(self.campaignId)
+        else:
+            logging.warning('{} needs campaignId'.format(self.name))
+            cid = ''
         if not self.tagFormats:
             self.tagFormats = 'PLACEMENT_TAG_TRACKING'
         if not self.compatibility:
             self.compatibility = 'DISPLAY'
         p_dict = {
             'name': '{}'.format(self.name),
-            'campaignId': int(self.campaignId),
+            'campaignId': cid,
             'compatibility': '{}'.format(self.compatibility),
             'siteId': '{}'.format(self.siteId),
             'size': {
