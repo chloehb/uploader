@@ -54,45 +54,45 @@ def main(arguments=None):
     args = get_args(arguments)
     if args.create:
         crc = cre.CreatorConfig('create/creator_config.xlsx')
-        error_dict = crc.do_all()
-        return error_dict
-    if args.api == 'all' or args.api == 'fb':
+        return crc.do_all()
+    results = []
+    if args.api in ('all', 'fb'):
         api = fbapi.FbApi(config_file='fbconfig.json')
-        if args.upload == 'all' or args.upload == 'c':
+        if args.upload in ('all', 'c'):
             cu = fbapi.CampaignUpload(config_file='campaign_upload.xlsx')
-            cu.upload_all_campaigns(api=api)
-        if args.upload == 'all' or args.upload == 'as':
+            results.extend(cu.upload_all_campaigns(api=api) or [])
+        if args.upload in ('all', 'as'):
             asu = fbapi.AdSetUpload(config_file='adset_upload.xlsx')
-            asu.upload_all_adsets(api=api)
-        if args.upload == 'all' or args.upload == 'ad':
+            results.extend(asu.upload_all_adsets(api=api) or [])
+        if args.upload in ('all', 'ad'):
             ctv = fbapi.Creative(creative_file='creative_hashes.csv')
             adu = fbapi.AdUpload(config_file='ad_upload.xlsx')
-            adu.upload_all_ads(api, ctv)
-    if args.api == 'all' or args.api == 'aw':
+            results.extend(adu.upload_all_ads(api, ctv) or [])
+    if args.api in ('all', 'aw'):
         api = awapi.AwApi(config_file='awconfig.yaml')
-        if args.upload == 'all' or args.upload == 'c':
+        if args.upload in ('all', 'c'):
             cu = awapi.CampaignUpload(config_file='aw_campaign_upload.xlsx')
-            cu.upload_all_campaigns(api)
-        if args.upload == 'all' or args.upload == 'as':
+            results.extend(cu.upload_all_campaigns(api) or [])
+        if args.upload in ('all', 'as'):
             agu = awapi.AdGroupUpload(config_file='aw_adgroup_upload.xlsx')
-            agu.upload_all_adgroups(api)
-        if args.upload == 'all' or args.upload == 'ad':
+            results.extend(agu.upload_all_adgroups(api) or [])
+        if args.upload in ('all', 'ad'):
             adu = awapi.AdUpload(config_file='aw_ad_upload.xlsx')
-            adu.upload_all_ads(api)
-    if args.api == 'all' or args.api == 'szk':
+            results.extend(adu.upload_all_ads(api) or [])
+    if args.api in ('all', 'szk'):
         api = szkapi.SzkApi(config_file='szkconfig.json')
-        if args.upload == 'all' or args.upload == 'c':
+        if args.upload in ('all', 'c'):
             cu = szkapi.CampaignUpload(config_file='szk_campaign_upload.xlsx')
             cu.upload_all_campaigns(api)
-    if args.api == 'all' or args.api == 'dcm':
+    if args.api in ('all', 'dcm'):
         api = dcapi.DcApi(config_file='dcapi.json')
-        if args.upload == 'all' or args.upload == 'c':
+        if args.upload in ('all', 'c'):
             cu = dcapi.CampaignUpload(config_file='campaign_upload.xlsx')
-            cu.upload_all_campaigns(api)
-        if args.upload == 'all' or args.upload == 'as':
+            results.extend(cu.upload_all_campaigns(api) or [])
+        if args.upload in ('all', 'as'):
             pu = dcapi.PlacementUpload(config_file='adset_upload.xlsx')
-            pu.upload_all_placements(api)
-    return {}
+            results.extend(pu.upload_all_placements(api) or [])
+    return {'results': results}
 
 
 if __name__ == '__main__':

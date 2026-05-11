@@ -14,6 +14,24 @@ config_path = os.path.join(utl.config_file_path, dcm_path)
 base_url = 'https://www.googleapis.com/dfareporting'
 
 
+def _populate_dcm_result(result, response):
+    """Fill ``result`` with platform_id / status / error from a DCM
+    create response. Mirrors ``awapi._populate_aw_result``.
+    """
+    body = response.json() if response is not None else {}
+    if not isinstance(body, dict):
+        body = {}
+    if 'id' in body:
+        result['platform_id'] = body['id']
+        result['status'] = 'created'
+        return
+    err = body.get('error') or {}
+    result['status'] = 'failed'
+    result['error_code'] = str(err.get('code', '')) or None
+    result['error_message'] = (
+        err.get('message') or 'Unknown error from DCM')
+
+
 class DcApi(object):
     version = '5'
 
@@ -290,16 +308,40 @@ class CampaignUpload(object):
 
     def upload_all_campaigns(self, api):
         total_camp = str(len(self.config))
+        results = []
         for idx, c_id in enumerate(self.config):
             logging.info('Uploading campaign {} of {}.  '
                          'Campaign Name: {}'.format(idx + 1, total_camp, c_id))
-            self.upload_campaign(api, c_id)
+            results.append(self.upload_campaign(api, c_id))
         logging.info('Pausing for 30s while campaigns finish uploading.')
+        return results
 
     def upload_campaign(self, api, campaign_id):
         campaign = self.set_campaign(campaign_id, api)
-        if campaign.upload_dict and not campaign.check_exists(api):
-            api.create_entity(campaign, entity_name='campaigns')
+        result = {
+            'source_name': campaign.name,
+            'object_level': 'Campaign',
+            'uploader_type': 'DCM',
+            'platform_id': None,
+            'parent_platform_id': None,
+            'status': None,
+            'error_code': None,
+            'error_message': None,
+        }
+        if not campaign.upload_dict:
+            result['status'] = 'skipped_dep_missing'
+            result['error_message'] = (
+                'Missing advertiserId or defaultLandingPage')
+            return result
+        if campaign.check_exists(api):
+            result['status'] = 'skipped_exists'
+            result['platform_id'] = campaign.id
+            return result
+        _populate_dcm_result(
+            result, api.create_entity(campaign, entity_name='campaigns'))
+        if result['status'] == 'created':
+            campaign.id = result['platform_id']
+        return result
 
 
 class Campaign(object):
@@ -310,6 +352,7 @@ class Campaign(object):
     def __init__(self, cam_dict, api=None, upload=True):
         self.defaultLandingPageId = None
         self.defaultLandingPage = None
+        self.advertiserId = None
         self.id = None
         self.upload = upload
         for k in cam_dict:
@@ -484,18 +527,46 @@ class PlacementUpload(object):
 
     def upload_all_placements(self, api):
         total_placements = str(len(self.config))
+        results = []
         for idx, p_id in enumerate(self.config):
             placement = self.set_placement(p_id, api)
             logging.info('Uploading placement {} of {}.  '
                          'Placement Name: {}'.format(idx + 1, total_placements,
                                                      placement.name))
-            self.upload_placement(api, placement)
+            results.append(self.upload_placement(api, placement))
         logging.info('Pausing for 30s while campaigns finish uploading.')
+        return results
 
     @staticmethod
     def upload_placement(api, placement):
-        if not placement.check_exists(api):
-            api.create_entity(placement, entity_name='placements')
+        result = {
+            'source_name': placement.name,
+            'object_level': 'Adset',
+            'uploader_type': 'DCM',
+            'platform_id': None,
+            'parent_platform_id': (
+                str(placement.campaignId)
+                if placement.campaignId else None),
+            'status': None,
+            'error_code': None,
+            'error_message': None,
+        }
+        if not placement.campaignId:
+            result['status'] = 'skipped_dep_missing'
+            result['error_message'] = (
+                'Campaign {!r} not found in account'.format(
+                    placement.campaign))
+            return result
+        if placement.check_exists(api):
+            existing = api.get_id(api.place_dict, placement.name)
+            if existing:
+                result['platform_id'] = existing[0]
+            result['status'] = 'skipped_exists'
+            return result
+        _populate_dcm_result(
+            result,
+            api.create_entity(placement, entity_name='placements'))
+        return result
 
     @staticmethod
     def generate_dcm_tags(api, campaign_id):
@@ -570,6 +641,12 @@ class Placement(object):
         self.siteId = site.id
 
     def check_exists(self, api):
+        if not self.campaignId:
+            logging.warning(
+                'Placement {!r} has no campaignId (campaign {!r} '
+                'was not found in account); skipping existence '
+                'check and upload.'.format(self.name, self.campaign))
+            return True
         if not api.place_dict:
             api.set_id_dict(dcm_object='placement', filter_id=self.campaignId)
         pid = api.get_id(api.place_dict, self.name)
@@ -582,6 +659,11 @@ class Placement(object):
     def get_campaign_id(self, api):
         campaign = Campaign({'name': self.campaign}, upload=False)
         campaign.set_id(api)
+        if campaign.id is None:
+            logging.warning(
+                'Campaign {!r} not found for placement {!r}; '
+                'placement will be skipped.'.format(
+                    self.campaign, self.name))
         self.campaignId = campaign.id
 
 

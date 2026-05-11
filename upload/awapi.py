@@ -15,6 +15,39 @@ aw_path = 'aw'
 config_path = os.path.join(utl.config_file_path, aw_path)
 
 
+def _populate_aw_result(result, r):
+    """Fill ``result`` with platform_id / status / error from a Google
+    Ads ``mutate`` response. ``r`` is the ``requests.Response``
+    returned by ``AwApi.mutate_service``.
+    """
+    try:
+        body = r.json() if r is not None else {}
+    except (ValueError, AttributeError):
+        body = {}
+    if isinstance(body, list):
+        body = body[0] if body else {}
+    if not isinstance(body, dict):
+        body = {}
+    if 'error' in body:
+        err = body.get('error') or {}
+        result['status'] = 'failed'
+        result['error_code'] = str(err.get('code', '')) or None
+        result['error_message'] = (
+            err.get('message') or 'Unknown error from Google Ads')
+        return
+    rows = body.get('results') or []
+    if rows:
+        first = rows[0] or {}
+        resource_name = first.get('resourceName')
+        if resource_name:
+            result['platform_id'] = resource_name.rsplit('/', 1)[-1]
+        result['status'] = 'created'
+    else:
+        result['status'] = 'failed'
+        result['error_message'] = (
+            'Google Ads mutate returned no results')
+
+
 class AwApi(object):
     version = 22
     base_url = 'https://googleads.googleapis.com/v{}/customers/'.format(version)
@@ -419,16 +452,35 @@ class CampaignUpload(object):
 
     def upload_all_campaigns(self, api):
         total_camp = str(len(self.config))
+        results = []
         for idx, c_id in enumerate(self.config):
             logging.info('Uploading campaign {} of {}.  '
                          'Campaign Name: {}'.format(idx + 1, total_camp, c_id))
-            self.upload_campaign(api, c_id)
+            results.append(self.upload_campaign(api, c_id))
         logging.info('Campaigns finished uploading.')
+        return results
 
     def upload_campaign(self, api, campaign_id):
         campaign = self.set_campaign(campaign_id)
-        if not campaign.check_exists(api):
-            api.create_campaign(campaign)
+        result = {
+            'source_name': campaign.name,
+            'object_level': 'Campaign',
+            'uploader_type': 'Adwords',
+            'platform_id': None,
+            'parent_platform_id': None,
+            'status': None,
+            'error_code': None,
+            'error_message': None,
+        }
+        if campaign.check_exists(api):
+            existing = api.get_id(api.cam_dict, campaign.name)
+            if existing:
+                result['platform_id'] = str(existing[0])
+            result['status'] = 'skipped_exists'
+            return result
+        r = api.create_campaign(campaign)
+        _populate_aw_result(result, r)
+        return result
 
 
 class Campaign(object):
@@ -612,16 +664,35 @@ class AdGroupUpload(object):
 
     def upload_all_adgroups(self, api):
         tot_ag = str(len(self.config))
+        results = []
         for idx, ag_id in enumerate(self.config):
             logging.info('Uploading adgroup {} of {}.'.format(idx + 1, tot_ag))
-            self.upload_adgroup(api, ag_id)
+            results.append(self.upload_adgroup(api, ag_id))
         logging.info('{} adgroups uploaded.'.format(tot_ag))
+        return results
 
     def upload_adgroup(self, api, ag_id):
         ag = self.set_adgroup(ag_id)
         logging.info('Adgroup name: {}'.format(ag.name))
-        if not ag.check_exists(api):
-            api.create_adgroup(ag)
+        result = {
+            'source_name': ag.name,
+            'object_level': 'Adset',
+            'uploader_type': 'Adwords',
+            'platform_id': None,
+            'parent_platform_id': None,
+            'status': None,
+            'error_code': None,
+            'error_message': None,
+        }
+        if ag.check_exists(api):
+            existing = api.get_id(api.ag_dict, ag.name)
+            if existing:
+                result['platform_id'] = str(existing[0])
+            result['status'] = 'skipped_exists'
+            return result
+        r = api.create_adgroup(ag)
+        _populate_aw_result(result, r)
+        return result
 
 
 class TargetConfig(object):
@@ -927,16 +998,32 @@ class AdUpload(object):
     def upload_all_ads(self, api):
         cu = self.upload_all_creatives(api)
         total_ad = str(len(self.config))
+        results = []
         for idx, ad_id in enumerate(self.config):
             logging.info('Uploading ad {} of {}.  '
                          'Ad Row: {}'.format(idx + 1, total_ad, ad_id + 2))
-            self.upload_ad(api, ad_id, cu)
+            results.append(self.upload_ad(api, ad_id, cu))
         logging.info('{} ads uploaded.'.format(total_ad))
+        return results
 
     def upload_ad(self, api, ad_id, cu):
         ad = self.set_ad(ad_id)
-        if not ad.check_exists(api, cu):
-            api.create_ad(ad)
+        result = {
+            'source_name': ad.name,
+            'object_level': 'Ad',
+            'uploader_type': 'Adwords',
+            'platform_id': None,
+            'parent_platform_id': None,
+            'status': None,
+            'error_code': None,
+            'error_message': None,
+        }
+        if ad.check_exists(api, cu):
+            result['status'] = 'skipped_exists'
+            return result
+        r = api.create_ad(ad)
+        _populate_aw_result(result, r)
+        return result
 
 
 class Ad(object):

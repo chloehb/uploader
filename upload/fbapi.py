@@ -140,10 +140,13 @@ class FbApi(object):
     def create_campaign(self, campaign_name, objective, status, spend_cap):
         if not self.cam_dict:
             self.set_id_name_dict(Campaign)
-        if campaign_name in ([x['name'] for x in self.cam_dict]):
+        existing = [x for x in self.cam_dict if x['name'] == campaign_name]
+        if existing:
             logging.warning(campaign_name + ' already in account.  This ' +
                                             'campaign was not uploaded.')
-            return None
+            return {'status': 'skipped_exists',
+                    'platform_id': existing[0].get('id'),
+                    'error_code': None, 'error_message': None}
         self.campaign = Campaign(parent_id=self.account.get_id_assured())
         self.campaign.update({
             Campaign.Field.name: campaign_name,
@@ -153,7 +156,15 @@ class FbApi(object):
             Campaign.Field.special_ad_categories: 'NONE',
             Campaign.Field.is_adset_budget_sharing_enabled: False,
         })
-        self.campaign.remote_create()
+        try:
+            self.campaign.remote_create()
+        except FacebookRequestError as e:
+            return {'status': 'failed', 'platform_id': None,
+                    'error_code': str(e.api_error_code() or '') or None,
+                    'error_message': e.api_error_message()}
+        return {'status': 'created',
+                'platform_id': self.campaign.get_id(),
+                'error_code': None, 'error_message': None}
 
     @staticmethod
     def geo_target_search(geos, location_types=Targeting.Field.country):
@@ -354,12 +365,20 @@ class FbApi(object):
                      pos):
         if not self.adset_dict:
             self.set_id_name_dict(AdSet, parent_ids=cids)
+        outcomes = []
         for cid in cids:
-            if adset_name in ([x['name'] for x in self.adset_dict
-                               if x['campaign_id'] == cid]):
+            existing = [x for x in self.adset_dict
+                        if x['name'] == adset_name
+                        and x['campaign_id'] == cid]
+            if existing:
                 msg = '{} already in campaign.  Adset was not uploaded.'.format(
                     adset_name)
                 logging.warning(msg)
+                outcomes.append({
+                    'status': 'skipped_exists',
+                    'platform_id': existing[0].get('id'),
+                    'parent_platform_id': cid,
+                    'error_code': None, 'error_message': None})
                 continue
             targeting = self.set_target(country, target, age_min, age_max,
                                         genders, device, pubs, pos)
@@ -424,13 +443,31 @@ class FbApi(object):
             if not bud_val:
                 msg = 'Budget value missing, did not upload'.format(params)
                 logging.warning(msg)
-                return None
+                outcomes.append({
+                    'status': 'failed', 'platform_id': None,
+                    'parent_platform_id': cid,
+                    'error_code': 'missing_budget',
+                    'error_message': 'Budget value missing'})
+                continue
             if bud_type == 'daily':
                 params[AdSet.Field.daily_budget] = int(bud_val)
             elif bud_type == 'lifetime':
                 params[AdSet.Field.lifetime_budget] = int(bud_val)
-            self.account.create_ad_set(params=params)
-        return True
+            try:
+                created = self.account.create_ad_set(params=params)
+            except FacebookRequestError as e:
+                outcomes.append({
+                    'status': 'failed', 'platform_id': None,
+                    'parent_platform_id': cid,
+                    'error_code': str(e.api_error_code() or '') or None,
+                    'error_message': e.api_error_message()})
+                continue
+            outcomes.append({
+                'status': 'created',
+                'platform_id': created.get('id') if created else None,
+                'parent_platform_id': cid,
+                'error_code': None, 'error_message': None})
+        return outcomes
 
     def upload_creative(self, creative_class, image_path):
         cre = creative_class(parent_id=self.account.get_id_assured())
@@ -489,12 +526,20 @@ class FbApi(object):
     def create_ad(self, ad_name, asids, title, body, desc, cta, durl, url,
                   prom_obj, ig_id, view_tag, ad_status, creative_hash=None,
                   vid_id=None):
+        outcomes = []
         for asid in asids:
-            if ad_name in [x['name'] for x in self.ad_dict
-                           if x['campaign_id'] == asid[1]
-                           and x['adset_id'] == asid[0]]:
+            existing = [x for x in self.ad_dict
+                        if x['name'] == ad_name
+                        and x['campaign_id'] == asid[1]
+                        and x['adset_id'] == asid[0]]
+            if existing:
                 logging.warning(ad_name + ' already in campaign/adset. ' +
                                 'This ad was not uploaded.')
+                outcomes.append({
+                    'status': 'skipped_exists',
+                    'platform_id': existing[0].get('id'),
+                    'parent_platform_id': asid[0],
+                    'error_code': None, 'error_message': None})
                 continue
             if vid_id:
                 params = self.get_video_ad_params(ad_name, asid, title, body,
@@ -513,25 +558,35 @@ class FbApi(object):
                                                  prom_obj, ig_id,
                                                  creative_hash, view_tag,
                                                  ad_status)
-            """
-            dof = {
-                "creative_features_spec": {
-                    "standard_enhancements": {
-                        "enroll_status": "OPT_OUT"
-                    }
-                }
-            }
-            params[Ad.Field.creative]['degrees_of_freedom_spec'] = dof
-            """
             params['contextual_multi_ads'] = {'enroll_status': 'OPT_OUT'}
+            created = None
+            last_err = None
             for attempt_number in range(100):
                 try:
-                    self.account.create_ad(params=params)
+                    created = self.account.create_ad(params=params)
                     break
                 except FacebookRequestError as e:
+                    last_err = e
                     continue_running = self.request_error(e)
                     if not continue_running:
                         break
+            if created is not None:
+                outcomes.append({
+                    'status': 'created',
+                    'platform_id': created.get('id') if created else None,
+                    'parent_platform_id': asid[0],
+                    'error_code': None, 'error_message': None})
+            else:
+                outcomes.append({
+                    'status': 'failed', 'platform_id': None,
+                    'parent_platform_id': asid[0],
+                    'error_code': (
+                        str(last_err.api_error_code() or '')
+                        if last_err else None) or None,
+                    'error_message': (
+                        last_err.api_error_message()
+                        if last_err else 'Unknown error from Facebook')})
+        return outcomes
 
     @staticmethod
     def check_add_instagram_threads_ids(story, ig_id):
@@ -783,16 +838,29 @@ class CampaignUpload(object):
 
     def upload_all_campaigns(self, api):
         total_campaigns = str(len(self.config))
+        results = []
         for idx, campaign in enumerate(self.config):
             logging.info('Uploading campaign ' + str(idx + 1) + ' of ' +
                          total_campaigns + '.  Campaign Name: ' + campaign)
-            self.upload_campaign(api, campaign)
+            results.append(self.upload_campaign(api, campaign))
+        return results
 
     def upload_campaign(self, api, campaign):
         self.check_config(campaign)
         self.set_campaign(campaign)
-        api.create_campaign(campaign, self.cam_objective, self.cam_status,
-                            self.cam_spend_cap)
+        outcome = api.create_campaign(
+            campaign, self.cam_objective, self.cam_status,
+            self.cam_spend_cap) or {}
+        return {
+            'source_name': campaign,
+            'object_level': 'Campaign',
+            'uploader_type': 'Facebook',
+            'platform_id': outcome.get('platform_id'),
+            'parent_platform_id': None,
+            'status': outcome.get('status') or 'failed',
+            'error_code': outcome.get('error_code'),
+            'error_message': outcome.get('error_message'),
+        }
 
 
 class AdSetUpload(object):
@@ -903,14 +971,16 @@ class AdSetUpload(object):
 
     def upload_all_adsets(self, api):
         total_adsets = str(len(self.config))
+        results = []
         for idx, adset in enumerate(self.config):
             logging.info('Uploading adset ' + str(idx + 1) + ' of ' +
                          total_adsets + '.  Adset Name: ' + adset)
-            self.upload_adset(api, adset)
+            results.extend(self.upload_adset(api, adset))
+        return results
 
     def upload_adset(self, api, adset):
         self.set_adset(adset)
-        self.format_adset(api)
+        return self.format_adset(api)
 
     def format_adset(self, api):
         cids = api.campaign_to_id(self.as_cam_name)
@@ -918,14 +988,33 @@ class AdSetUpload(object):
             msg = 'Campaign {} does not exist.  {} was not uploaded'.format(
                 self.as_cam_name, self.as_name)
             logging.warning(msg)
-            return False
-        api.create_adset(self.as_name, cids, self.as_goal, self.as_budget_type,
-                         self.as_budget_value, self.as_bill_evt, self.as_bid,
-                         self.as_status, self.as_start_time, self.as_end_time,
-                         self.as_prom_page, self.as_country, self.as_target,
-                         self.as_age_min, self.as_age_max, self.as_genders,
-                         self.as_device, self.as_pubs, self.as_pos)
-        return True
+            return [{
+                'source_name': self.as_name,
+                'object_level': 'Adset',
+                'uploader_type': 'Facebook',
+                'platform_id': None,
+                'parent_platform_id': None,
+                'status': 'skipped_dep_missing',
+                'error_code': None,
+                'error_message': msg,
+            }]
+        outcomes = api.create_adset(
+            self.as_name, cids, self.as_goal, self.as_budget_type,
+            self.as_budget_value, self.as_bill_evt, self.as_bid,
+            self.as_status, self.as_start_time, self.as_end_time,
+            self.as_prom_page, self.as_country, self.as_target,
+            self.as_age_min, self.as_age_max, self.as_genders,
+            self.as_device, self.as_pubs, self.as_pos) or []
+        return [{
+            'source_name': self.as_name,
+            'object_level': 'Adset',
+            'uploader_type': 'Facebook',
+            'platform_id': o.get('platform_id'),
+            'parent_platform_id': o.get('parent_platform_id'),
+            'status': o.get('status') or 'failed',
+            'error_code': o.get('error_code'),
+            'error_message': o.get('error_message'),
+        } for o in outcomes]
 
 
 class AdUpload(object):
@@ -1063,48 +1152,76 @@ class AdUpload(object):
                          if x['name'] in adset_names]
             api.set_id_name_dict(Ad, parent_ids=adset_ids)
         total_ads = str(len(self.config))
+        results = []
         for idx, ad in enumerate(self.config):
             logging.info('Uploading ad ' + str(idx + 1) + ' of ' + total_ads +
                          '.  Ad Name: ' + ad)
-            self.upload_ad(ad, api)
+            results.extend(self.upload_ad(ad, api))
+        return results
 
     def upload_ad(self, ad, api):
         self.set_ad(ad)
-        self.format_ad(api)
+        return self.format_ad(api)
+
+    def _ad_skip_result(self, message):
+        return [{
+            'source_name': self.ad_name,
+            'object_level': 'Ad',
+            'uploader_type': 'Facebook',
+            'platform_id': None,
+            'parent_platform_id': None,
+            'status': 'skipped_dep_missing',
+            'error_code': None,
+            'error_message': message,
+        }]
 
     def format_ad(self, api):
         cids = api.campaign_to_id(self.ad_cam_name)
         asids = api.adset_to_id(self.ad_adset_name, cids)
         if not cids:
-            logging.warning(str(self.ad_cam_name) + ' does not exist in the ' +
-                            'account.  ' + str(self.ad_name) + ' was not ' +
-                            'uploaded.')
-            return None
+            msg = '{} does not exist in the account. {} was not uploaded.'\
+                .format(self.ad_cam_name, self.ad_name)
+            logging.warning(msg)
+            return self._ad_skip_result(msg)
         if not asids:
-            logging.warning(str(self.ad_adset_name) + ' does not exist in ' +
-                            'the account.  ' + str(self.ad_name) + ' was ' +
-                            'not uploaded.')
-            return None
+            msg = '{} does not exist in the account. {} was not uploaded.'\
+                .format(self.ad_adset_name, self.ad_name)
+            logging.warning(msg)
+            return self._ad_skip_result(msg)
+        outcomes = []
         if len(self.ad_filename) == 1 and len(self.ad_filename[0]) == 1:
-            api.create_ad(self.ad_name, asids, self.ad_title[0],
-                          self.ad_body,  self.ad_desc[0], self.ad_cta,
-                          self.ad_d_link,  self.ad_link[0], self.ad_prom_page,
-                          self.ad_ig_id, self.ad_view_tag, self.ad_status,
-                          self.ad_filename[0][0])
+            outcomes = api.create_ad(
+                self.ad_name, asids, self.ad_title[0],
+                self.ad_body, self.ad_desc[0], self.ad_cta,
+                self.ad_d_link, self.ad_link[0], self.ad_prom_page,
+                self.ad_ig_id, self.ad_view_tag, self.ad_status,
+                self.ad_filename[0][0])
         elif len(self.ad_filename) == 1 and len(self.ad_filename[0]) == 2:
-            api.create_ad(self.ad_name, asids, self.ad_title[0], self.ad_body,
-                          self.ad_desc[0], self.ad_cta, self.ad_d_link,
-                          self.ad_link[0], self.ad_prom_page, self.ad_ig_id,
-                          self.ad_view_tag, self.ad_status,
-                          self.ad_filename[0][1],
-                          vid_id=self.ad_filename[0][0])
+            outcomes = api.create_ad(
+                self.ad_name, asids, self.ad_title[0], self.ad_body,
+                self.ad_desc[0], self.ad_cta, self.ad_d_link,
+                self.ad_link[0], self.ad_prom_page, self.ad_ig_id,
+                self.ad_view_tag, self.ad_status,
+                self.ad_filename[0][1],
+                vid_id=self.ad_filename[0][0])
         elif len(self.ad_filename) > 1:
-            api.create_ad(self.ad_name, asids, self.ad_title, self.ad_body,
-                          self.ad_desc, self.ad_cta, self.ad_d_link,
-                          self.ad_link, self.ad_prom_page, self.ad_ig_id,
-                          self.ad_view_tag, self.ad_status,
-                          self.ad_filename)
-        return True
+            outcomes = api.create_ad(
+                self.ad_name, asids, self.ad_title, self.ad_body,
+                self.ad_desc, self.ad_cta, self.ad_d_link,
+                self.ad_link, self.ad_prom_page, self.ad_ig_id,
+                self.ad_view_tag, self.ad_status,
+                self.ad_filename)
+        outcomes = outcomes or []
+        return [{
+            'source_name': self.ad_name,
+            'object_level': 'Ad',
+            'uploader_type': 'Facebook',
+            'platform_id': o.get('platform_id'),
+            'parent_platform_id': o.get('parent_platform_id'),
+            'status': o.get('status') or 'failed',
+            'error_code': o.get('error_code'),
+            'error_message': o.get('error_message'),
+        } for o in outcomes]
 
 
 class Creative(object):

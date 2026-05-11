@@ -221,6 +221,8 @@ class Creator(object):
                 as_name = adset.replace('_unique_label', '')
                 combined_list[as_name] = self.df[adset].to_list()
                 name_col = [x for x in name_col if x != adset]
+            if not name_col:
+                name_col = ['None']
             combined_list[self.col_name] = self.df[name_col[0]].to_list()
         else:
             combined_list = self.get_combined_list()
