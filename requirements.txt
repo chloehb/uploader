@@ -1,7 +1,6 @@
-numpy==1.24.2
-pandas==2.0.0
-facebook_business==14.0.0
-googleads==16.0.0
-pyyaml==5.4.1
+numpy==2.2.2
+pandas==2.2.3
+facebook_business==24.0.1
+pyyaml==6.0.2
 xlrd==1.2.0
-requests==2.31.0
+requests==2.34.0

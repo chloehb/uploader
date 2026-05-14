@@ -295,6 +295,12 @@ class CampaignUpload(object):
 
     def load_config(self, config_file='campaign_upload.xlsx'):
         df = pd.read_excel(os.path.join(config_path, config_file))
+        if self.name not in df.columns:
+            logging.warning(
+                '{} column missing from {}.  Skipping load.'.format(
+                    self.name, config_file))
+            self.config = {}
+            return
         df = df.dropna(subset=[self.name])
         df = df.fillna('')
         df = utl.data_to_type(df, date_col=[self.sd, self.ed])

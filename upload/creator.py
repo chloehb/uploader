@@ -380,7 +380,7 @@ class Creator(object):
             (col_name_1, col_label_1),
             (col_name_2, col_label_2)]
         for col_list, col_label in full_col_list:
-            if not col_list:
+            if not col_list or not isinstance(col_list, str):
                 continue
             split_col_list = col_list.split('|')
             for col in split_col_list:

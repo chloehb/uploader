@@ -172,4 +172,7 @@ def read_excel(file_name, kwargs=None):
         except (zipfile.BadZipFile, ValueError, EOFError) as e:
             logging.warning(e)
             time.sleep(1)
+        except FileNotFoundError as e:
+            logging.warning(e)
+            break
     return df
