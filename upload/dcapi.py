@@ -53,6 +53,7 @@ class DcApi(object):
         self.place_dict = {}
         self.tag_dict = {}
         self.ad_dict = {}
+        self.creative_dict = {}
         self.directory_site_dict = {}
         self.df = pd.DataFrame()
         self.r = None
@@ -226,6 +227,27 @@ class DcApi(object):
                                      request_filter=request_filter)
         return site_dict
 
+    def get_creative_id_dict(self, advertiser_id=None, campaign_id=None):
+        parent = {'advertiserId': 'advertiserId'}
+        fields = {'id': 'id', 'name': 'name'}
+        request_filter = {}
+        if campaign_id:
+            request_filter['campaignId'] = campaign_id
+        elif advertiser_id:
+            request_filter['advertiserId'] = advertiser_id
+        return self.get_id_dict(
+            entity='creatives', parent=parent, fields=fields,
+            resp_entity='creatives',
+            request_filter=request_filter or None)
+
+    def get_ad_id_dict(self, campaign_id=None):
+        parent = {'campaignId': 'campaignId'}
+        fields = {'id': 'id', 'name': 'name'}
+        request_filter = {'campaignIds': campaign_id} if campaign_id else None
+        return self.get_id_dict(
+            entity='ads', parent=parent, fields=fields,
+            resp_entity='ads', request_filter=request_filter)
+
     def set_id_dict(self, dcm_object=None, filter_id=None):
         if dcm_object == 'landing_page':
             self.lp_dict = self.get_lp_id_dict()
@@ -240,6 +262,11 @@ class DcApi(object):
                 filter_id)
         if dcm_object == 'tags':
             self.tag_dict = self.get_tag_id_dict(filter_id)
+        if dcm_object == 'creative':
+            self.creative_dict = self.get_creative_id_dict(
+                campaign_id=filter_id)
+        if dcm_object == 'ad':
+            self.ad_dict = self.get_ad_id_dict(campaign_id=filter_id)
 
     def create_entity(self, entity, entity_name=''):
         url = self.create_url(entity_name)
@@ -754,21 +781,225 @@ class Site(object):
 
 
 class AdUpload(object):
+    file_name = 'ad_upload.xlsx'
+    name = 'name'
+    campaign = 'campaign'
+    placement = 'placement'
+    creative = 'creative'
     active = 'active'
+    type = 'type'
+    startTime = 'startTime'
+    endTime = 'endTime'
+    # Relation-picker keys (DCM API field names).
     campaignId = 'campaignId'
     creativeRotation = 'creativeRotation'
     deliverySchedule = 'deliverySchedule'
-    endTime = 'endTime'
-    startTime = 'startTime'
-    type = 'type'
     placementAssignments = 'placementAssignments'
-    creative = 'creative'
 
-    def __init__(self):
-        pass
+    def __init__(self, config_file=None):
+        self.config_file = config_file
+        self.config = None
+        if self.config_file:
+            self.load_config(self.config_file)
+
+    def load_config(self, config_file=''):
+        if not config_file:
+            config_file = self.file_name
+        file_name = os.path.join(config_path, config_file)
+        if not os.path.exists(file_name):
+            logging.warning(f'Ad config missing: {file_name}')
+            return False
+        df = utl.read_excel(file_name)
+        df = df.dropna(subset=[self.name]).fillna('')
+        df = utl.data_to_type(
+            df, date_col=[self.startTime, self.endTime])
+        for col in [self.startTime, self.endTime]:
+            df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%S-07:00')
+        self.config = df.to_dict(orient='index')
+        return True
+
+    def set_ad(self, ad_id, api=None):
+        return Ad(self.config[ad_id], api=api)
+
+    def upload_all_ads(self, api):
+        if not self.config:
+            return []
+        total = len(self.config)
+        results = []
+        for idx, a_id in enumerate(self.config):
+            ad = self.set_ad(a_id, api)
+            logging.info(
+                f'Uploading ad {idx + 1} of {total}. Ad Name: {ad.name}')
+            results.append(self.upload_ad(api, ad))
+        return results
+
+    @staticmethod
+    def upload_ad(api, ad):
+        result = {
+            'source_name': ad.name,
+            'object_level': 'Ad',
+            'uploader_type': 'DCM',
+            'platform_id': None,
+            'parent_platform_id': (
+                str(ad.campaignId) if ad.campaignId else None),
+            'status': None,
+            'error_code': None,
+            'error_message': None,
+        }
+        if not ad.campaignId:
+            result['status'] = 'skipped_dep_missing'
+            result['error_message'] = (
+                f'Campaign {ad.campaign!r} not found in account')
+            return result
+        if not ad.creativeId:
+            result['status'] = 'skipped_dep_missing'
+            result['error_message'] = (
+                f'Creative {ad.creative!r} not found in advertiser')
+            return result
+        if not ad.placementIds:
+            result['status'] = 'skipped_dep_missing'
+            result['error_message'] = (
+                f'No placements resolved for {ad.name!r}')
+            return result
+        if ad.check_exists(api):
+            existing = api.get_id(api.ad_dict, ad.name)
+            if existing:
+                result['platform_id'] = existing[0]
+            result['status'] = 'skipped_exists'
+            return result
+        _populate_dcm_result(
+            result, api.create_entity(ad, entity_name='ads'))
+        return result
+
+
+class Ad(object):
+    __slots__ = ['name', 'campaign', 'campaignId', 'placement',
+                 'placementIds', 'creative', 'creativeId', 'active',
+                 'type', 'startTime', 'endTime', 'upload_dict', 'api',
+                 'upload']
+
+    def __init__(self, row_dict, api=None, upload=True):
+        self.name = None
+        self.campaign = None
+        self.campaignId = None
+        self.placement = None
+        self.placementIds = []
+        self.creative = None
+        self.creativeId = None
+        self.active = True
+        self.type = 'AD_SERVING_STANDARD_AD'
+        self.startTime = None
+        self.endTime = None
+        self.upload = upload
+        for k in row_dict:
+            try:
+                setattr(self, k, row_dict[k])
+            except AttributeError as e:
+                logging.warning('AttributeError: {}'.format(e))
+                continue
+        self.api = api
+        if self.api:
+            self.resolve_ids(self.api)
+        if self.upload:
+            self.upload_dict = self.create_ad_dict()
+
+    def resolve_ids(self, api):
+        cam = Campaign({'name': self.campaign}, upload=False)
+        cam.set_id(api)
+        self.campaignId = cam.id
+        if not self.campaignId:
+            return
+        if not api.place_dict:
+            api.set_id_dict(dcm_object='placement',
+                            filter_id=self.campaignId)
+        placement_names = [
+            p.strip() for p in str(self.placement or '').split('|')
+            if p.strip()]
+        self.placementIds = []
+        for pname in placement_names:
+            pid = api.get_id(api.place_dict, pname)
+            if pid:
+                self.placementIds.append(pid[0])
+        if not api.creative_dict:
+            api.set_id_dict(dcm_object='creative',
+                            filter_id=self.campaignId)
+        if self.creative:
+            cre = api.get_id(api.creative_dict, self.creative)
+            if cre:
+                self.creativeId = cre[0]
+
+    def create_ad_dict(self):
+        if not (self.campaignId and self.creativeId and self.placementIds):
+            return {}
+        ad_dict = {
+            'name': str(self.name),
+            'campaignId': int(self.campaignId),
+            'active': bool(self.active),
+            'type': str(self.type),
+            'placementAssignments': [
+                {'placementId': int(pid), 'active': True}
+                for pid in self.placementIds],
+            'creativeRotation': {
+                'creativeAssignments': [{
+                    'creativeId': int(self.creativeId),
+                    'active': True,
+                    'clickThroughUrl': {'defaultLandingPage': True},
+                }],
+            },
+        }
+        if self.startTime:
+            ad_dict['startTime'] = str(self.startTime)
+        if self.endTime:
+            ad_dict['endTime'] = str(self.endTime)
+        return ad_dict
+
+    def check_exists(self, api):
+        if not self.campaignId:
+            return True
+        if not api.ad_dict:
+            api.set_id_dict(dcm_object='ad', filter_id=self.campaignId)
+        aid = api.get_id(api.ad_dict, self.name)
+        if aid:
+            logging.warning(
+                f'{self.name} already in account. Not uploaded.')
+            return True
+        return False
+
+
+class Creative(object):
+    """Resolve a DCM creative by name. Uploading new creatives
+    via the multipart asset chain is a follow-up."""
+    __slots__ = ['name', 'campaignId', 'advertiserId', 'id', 'api']
+
+    def __init__(self, cre_dict, api=None):
+        self.name = None
+        self.campaignId = None
+        self.advertiserId = None
+        self.id = None
+        for k in cre_dict:
+            try:
+                setattr(self, k, cre_dict[k])
+            except AttributeError as e:
+                logging.warning('AttributeError: {}'.format(e))
+                continue
+        self.api = api
+        if self.api:
+            self.set_id(self.api)
+
+    def set_id(self, api):
+        if not api.creative_dict:
+            api.set_id_dict(dcm_object='creative',
+                            filter_id=self.campaignId)
+        if not self.name:
+            return
+        cid = api.get_id(api.creative_dict, self.name)
+        if cid:
+            self.id = cid[0]
 
 
 class Asset(object):
+    """Creative-asset identifier wrapper. Full multipart asset
+    upload is a follow-up."""
     name = 'name'
     type = 'asset_type'
 
@@ -778,11 +1009,12 @@ class Asset(object):
         self.upload_dict = self.create_upload_dict()
 
     def create_upload_dict(self):
-        upload_dict = {'assetIdentifier': {'name': self.name,
-                                           'type': self.type}}
-        return upload_dict
+        return {'assetIdentifier': {'name': self.name,
+                                    'type': self.type}}
 
     def upload(self, api):
-        logging.info('Uploading asset with {}'.format(self.upload_dict))
-        r = api.create_enity(self, entity='creativeAssets')
-        self.id = r.json()['id']
+        logging.info(f'Uploading asset with {self.upload_dict}')
+        r = api.create_entity(self, entity_name='creativeAssets')
+        body = r.json() if r is not None else {}
+        if isinstance(body, dict) and 'id' in body:
+            self.id = body['id']

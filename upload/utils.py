@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import zipfile
+import xml.etree.ElementTree as ET
 import pandas as pd
 import datetime as dt
 
@@ -169,7 +170,8 @@ def read_excel(file_name, kwargs=None):
         try:
             df = pd.read_excel(file_name, **kwargs)
             break
-        except (zipfile.BadZipFile, ValueError, EOFError) as e:
+        except (zipfile.BadZipFile, ValueError, EOFError,
+                ET.ParseError) as e:
             logging.warning(e)
             time.sleep(1)
         except FileNotFoundError as e:

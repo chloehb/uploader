@@ -5,6 +5,7 @@ import upload.creator as cre
 import upload.fbapi as fbapi
 import upload.awapi as awapi
 import upload.dcapi as dcapi
+import upload.redditapi as redditapi
 import upload.szkapi as szkapi
 
 
@@ -92,6 +93,20 @@ def main(arguments=None):
         if args.upload in ('all', 'as'):
             pu = dcapi.PlacementUpload(config_file='adset_upload.xlsx')
             results.extend(pu.upload_all_placements(api) or [])
+        if args.upload in ('all', 'ad'):
+            adu = dcapi.AdUpload(config_file='ad_upload.xlsx')
+            results.extend(adu.upload_all_ads(api) or [])
+    if args.api in ('all', 'reddit'):
+        api = redditapi.RedditApi(config_file='redditconfig.json')
+        if args.upload in ('all', 'c'):
+            cu = redditapi.CampaignUpload(config_file='campaign_upload.xlsx')
+            results.extend(cu.upload_all_campaigns(api) or [])
+        if args.upload in ('all', 'as'):
+            agu = redditapi.AdGroupUpload(config_file='adset_upload.xlsx')
+            results.extend(agu.upload_all_adgroups(api) or [])
+        if args.upload in ('all', 'ad'):
+            adu = redditapi.AdUpload(config_file='ad_upload.xlsx')
+            results.extend(adu.upload_all_ads(api) or [])
     return {'results': results}
 
 
