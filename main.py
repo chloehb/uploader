@@ -41,7 +41,8 @@ sys.excepthook = handle_exception
 def get_args(arguments=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--create', action='store_true')
-    parser.add_argument('--api', choices=['all', 'fb', 'aw', 'szk', 'dcm'])
+    parser.add_argument(
+        '--api', choices=['all', 'fb', 'aw', 'szk', 'dcm', 'reddit'])
     parser.add_argument('--upload', choices=['all', 'c', 'as', 'ad'])
     if arguments:
         args = parser.parse_args(arguments.split())

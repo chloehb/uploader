@@ -306,6 +306,31 @@ class DcApi(object):
         logging.warning('Unknown error: {}'.format(self.r.text))
         sys.exit(0)
 
+    def upload_creative(self, file_path, advertiser_id=None):
+        """Upload a local asset to the dfareporting media-upload
+        endpoint and return its id. Wire format unverified — validate
+        on a real account before relying on it in live trafficking.
+        """
+        upload_base = base_url.replace(
+            'www.googleapis.com/dfareporting',
+            'www.googleapis.com/upload/dfareporting')
+        url = ('{}/v{}/userprofiles/{}/creativeAssets/{}/creativeAssets'
+               '?uploadType=media'.format(
+                   upload_base, self.version, self.usr_id,
+                   advertiser_id or ''))
+        self.get_client()
+        with open(file_path, 'rb') as f:
+            r = self.client.post(url, data=f.read())
+        try:
+            body = r.json() if r is not None else {}
+        except (ValueError, AttributeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        asset_id = (body.get('id')
+                    or (body.get('assetIdentifier') or {}).get('name'))
+        return {'id': asset_id}
+
 
 class CampaignUpload(object):
     name = 'name'
@@ -1018,3 +1043,19 @@ class Asset(object):
         body = r.json() if r is not None else {}
         if isinstance(body, dict) and 'id' in body:
             self.id = body['id']
+
+
+class CreativeUpload(utl.BaseCreativeStore):
+    """DCM creative store: filename -> uploaded-asset id in
+    ``dcm_creative_ids.csv``, resolved for ad creation. Per-file
+    upload lives on ``DcApi.upload_creative``; this class is the
+    shared find-new / persist bookkeeping only.
+    """
+    id_cols = ('id',)
+
+    def __init__(self, id_file_name='dcm_creative_ids.csv',
+                 creative_path='creative/'):
+        super().__init__(id_file_name, creative_path)
+
+    def _upload_one(self, api, file_path):
+        return api.upload_creative(file_path)

@@ -2,6 +2,7 @@ import os
 import sys
 import yaml
 import uuid
+import base64
 import logging
 import requests
 import numpy as np
@@ -215,6 +216,30 @@ class AwApi(object):
         if 'error' in r.json():
             logging.warning('Could not upload: {}'.format(r.json()))
         return r
+
+    def upload_creative(self, file_path):
+        """Upload a local image as a Google Ads image asset
+        (``assets:mutate``; the old ``MediaService`` is gone) and
+        return its ids. Wire format unverified — validate on a real
+        account before relying on it in live ad creation.
+        """
+        with open(file_path, 'rb') as f:
+            data = base64.b64encode(f.read()).decode('ascii')
+        operand = {'name': os.path.basename(file_path),
+                   'type': 'IMAGE',
+                   'imageAsset': {'data': data}}
+        r = self.mutate_service('assets', operand)
+        try:
+            body = r.json() if r is not None else {}
+        except (ValueError, AttributeError):
+            body = {}
+        if isinstance(body, list):
+            body = body[0] if body else {}
+        results = (body or {}).get('results') or []
+        resource_name = results[0].get('resourceName') if results else None
+        asset_id = (resource_name.rsplit('/', 1)[-1]
+                    if resource_name else None)
+        return {'mediaId': asset_id, 'referenceId': resource_name}
 
     def get_id_dict(self, service='campaign', parent=None, page_len=100,
                     fields=None, nest=None, selector_fields=True):
@@ -982,18 +1007,16 @@ class AdUpload(object):
                       self.config if self.config[x][self.image])
         creatives = creatives.union(img_cre)
         cu = CreativeUpload()
-        cu.upload_all_creatives(api, creatives)
-        self.creative_filename_to_id(cu.config)
+        cu.upload_all(api, list(creatives))
+        self.creative_filename_to_id(cu)
         return cu
 
-    def creative_filename_to_id(self, table):
+    def creative_filename_to_id(self, cu):
         for k in self.config:
             for img in [self.marketing_image, self.image]:
                 if self.config[k][img]:
-                    media_id = (table[table[CreativeUpload.file_name] ==
-                                      self.config[k][img]]
-                                [CreativeUpload.media_id].values[0])
-                    self.config[k][img] = media_id
+                    self.config[k][img] = cu.get_id(
+                        self.config[k][img], CreativeUpload.media_id)
 
     def upload_all_ads(self, api):
         cu = self.upload_all_creatives(api)
@@ -1062,10 +1085,11 @@ class Ad(object):
         return not self.__eq__(other)
 
     def set_media_id_from_ref(self):
-        if self.image and self.cu:
-            self.image['mediaId'] = \
-                (self.cu.config[self.cu.config['referenceId'] ==
-                                self.image['referenceId']]['mediaId'].values[0])
+        if self.image and self.cu and isinstance(self.image, dict):
+            media_id = self.cu.media_id_for_reference(
+                self.image.get('referenceId'))
+            if media_id is not None:
+                self.image['mediaId'] = media_id
 
     def create_ad_dict(self):
         self.set_media_id_from_ref()
@@ -1139,77 +1163,28 @@ class Ad(object):
         }
 
 
-class CreativeUpload(object):
-    id_file_path = 'creative/'
+class CreativeUpload(utl.BaseCreativeStore):
+    """Google Ads creative store. Persists filename -> image-asset id
+    in ``aw_creative_ids.csv`` and resolves it for ad creation. The
+    per-file upload (``assets:mutate``) lives on ``AwApi`` so this
+    class is the shared find-new / persist bookkeeping only.
+    """
     file_name = 'file_name'
     media_id = 'mediaId'
     reference_id = 'referenceId'
+    fn_col = file_name
+    id_cols = (media_id, reference_id)
 
-    def __init__(self, config=None, id_file_name='aw_creative_ids.csv'):
-        self.config = config
-        self.id_file_name = os.path.join(self.id_file_path, id_file_name)
-        if self.id_file_name:
-            self.config = self.load_config()
+    def __init__(self, id_file_name='aw_creative_ids.csv',
+                 creative_path='creative/'):
+        super().__init__(id_file_name, creative_path)
 
-    def load_config(self):
-        if not os.path.exists(self.id_file_name):
-            utl.dir_check(self.id_file_path)
-            cols = [self.file_name, self.media_id, self.reference_id]
-            df = pd.DataFrame(columns=cols)
-            df.to_csv(self.id_file_name, index=False)
-        self.config = pd.read_csv(self.id_file_name)
-        return self.config
+    def _upload_one(self, api, file_path):
+        return api.upload_creative(file_path)
 
-    def upload_all_creatives(self, api, full_creative_list):
-        creatives = [x for x in full_creative_list
-                     if x not in list(self.config[self.file_name].values)]
-        total_creative = len(creatives)
-        for idx, creative in enumerate(creatives):
-            logging.info('Uploading creative {} of {}.  Creative Name: '
-                         '{}'.format(idx+1, total_creative, creative))
-            full_creative = os.path.join('creative/', creative)
-            if os.path.isfile(full_creative):
-                resp = self.upload_creative(api, full_creative)
-                cre_dict = {self.media_id: [resp[0][self.media_id]],
-                            self.reference_id: [resp[0][self.reference_id]],
-                            self.file_name: [creative]}
-                self.config = self.config.append(pd.DataFrame(cre_dict))
-                self.config = self.config.reset_index(drop=True)
-            else:
-                logging.warning('{} not found.  '
-                                'It was not uploaded'.format(creative))
-        self.write_df_to_csv()
-
-    @staticmethod
-    def upload_creative(api, filename):
-        with open(filename, 'rb') as image_handle:
-            image_data = image_handle.read()
-        if filename.split('.')[1] == '.zip':
-            media = [{
-                'xsi_type': 'MediaBundle',
-                'data': image_data,
-                'type': 'MEDIA_BUNDLE'
-            }]
-        else:
-            media = {
-              'type': 'IMAGE',
-              'data': image_data,
-              'xsi_type': 'Image'
-            }
-        svc = api.get_service('MediaService')
-        resp = svc.upload(media)
-        return resp
-
-    @staticmethod
-    def dict_to_df(dictionary, first_col, second_col):
-        df = pd.Series(dictionary, name=second_col)
-        df.index.name = first_col
-        df = df.reset_index()
-        return df
-
-    def write_df_to_csv(self):
-        try:
-            self.config.to_csv(self.id_file_name, index=False)
-        except IOError:
-            logging.warning('{} could not be opened. This dictionary was not '
-                            'saved.'.format(self.id_file_name))
+    def media_id_for_reference(self, reference_id):
+        """Reverse-resolve an asset's mediaId from its referenceId."""
+        for rec in self.records.values():
+            if rec.get(self.reference_id) == reference_id:
+                return rec.get(self.media_id)
+        return None

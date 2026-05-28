@@ -1225,6 +1225,12 @@ class AdUpload(object):
 
 
 class Creative(object):
+    """Facebook creative store (filename -> asset hash). This is the
+    production reference the shared ``utils.BaseCreativeStore`` was
+    extracted from; FB keeps its own ``{path: hash}`` CSV format so
+    existing ``creative_hashes.csv`` files stay valid, while AW / DCM /
+    Reddit use the shared base.
+    """
     def __init__(self, creative_file=None, creative_path='creative/'):
         self.creative_path = creative_path
         self.creative_file = creative_file

@@ -17,6 +17,95 @@ def dir_check(directory):
         os.makedirs(directory)
 
 
+class BaseCreativeStore(object):
+    """Shared filename->platform-id bookkeeping for creative upload.
+
+    Each ad channel keeps a small CSV mapping a local creative
+    filename to the id(s) the platform returned, so re-runs skip files
+    already uploaded. Subclasses set ``id_cols`` and implement
+    ``_upload_one(api, file_path)`` returning ``{id_col: value}``; this
+    base owns the find-new / upload-loop / persist / resolve cycle so
+    each channel writes one method, not a bespoke pipeline.
+
+    The shape was extracted from ``fbapi.Creative`` (the production
+    reference), which keeps its own ``{path: hash}`` CSV format and is
+    intentionally left untouched so existing ``creative_hashes.csv``
+    files stay valid.
+    """
+    fn_col = 'filename'
+    id_cols = ('id',)
+
+    def __init__(self, id_file_name, creative_path='creative/'):
+        self.creative_path = creative_path
+        self.id_file_name = os.path.join(creative_path, id_file_name)
+        self.records = {}
+        self.load_config()
+
+    def load_config(self):
+        cols = [self.fn_col, *self.id_cols]
+        if not os.path.isfile(self.id_file_name):
+            dir_check(os.path.dirname(
+                os.path.abspath(self.id_file_name)))
+            pd.DataFrame(columns=cols).to_csv(
+                self.id_file_name, index=False)
+        df = pd.read_csv(self.id_file_name)
+        self.records = {}
+        for _, row in df.iterrows():
+            fn = row.get(self.fn_col)
+            if pd.isna(fn):
+                continue
+            self.records[str(fn)] = {
+                c: (None if pd.isna(row.get(c)) else row.get(c))
+                for c in self.id_cols}
+        return self.records
+
+    def get_new(self, filenames):
+        """Bare filenames not already in the store (and not NaN)."""
+        return [fn for fn in filenames
+                if fn and str(fn) != 'nan' and fn not in self.records]
+
+    def upload_all(self, api, filenames):
+        new = self.get_new(filenames)
+        total = len(new)
+        for idx, fn in enumerate(new):
+            logging.info('Uploading creative {} of {}.  Creative '
+                         'Name: {}'.format(idx + 1, total, fn))
+            path = os.path.join(self.creative_path, fn)
+            if not os.path.isfile(path):
+                logging.warning('{} not found.  It was not '
+                                'uploaded'.format(path))
+                continue
+            ids = self._upload_one(api, path) or {}
+            self.records[fn] = {c: ids.get(c) for c in self.id_cols}
+        self.write()
+        return self
+
+    def _upload_one(self, api, file_path):
+        """Push one local file to the platform; return ``{id_col:
+        value}``. Implemented per channel."""
+        raise NotImplementedError
+
+    def get_id(self, filename, id_col=None):
+        rec = self.records.get(filename)
+        if not rec:
+            return None
+        return rec.get(id_col or self.id_cols[0])
+
+    def write(self):
+        rows = []
+        for fn, rec in self.records.items():
+            row = {self.fn_col: fn}
+            for col in self.id_cols:
+                row[col] = rec.get(col)
+            rows.append(row)
+        df = pd.DataFrame(rows, columns=[self.fn_col, *self.id_cols])
+        try:
+            df.to_csv(self.id_file_name, index=False)
+        except IOError:
+            logging.warning('{} could not be opened. Creative ids '
+                            'not saved.'.format(self.id_file_name))
+
+
 def dir_remove(directory):
     if os.path.isdir(directory):
         if not os.listdir(directory):

@@ -180,6 +180,24 @@ class RedditApi(object):
         elif kind == 'creative':
             self.creative_dict = self._list('creatives')
 
+    def upload_creative(self, file_path):
+        """Upload a local asset to the ad-account ``media`` endpoint and
+        return its media id. Wire format unverified — validate on a
+        real account before relying on it in live trafficking.
+        """
+        self.get_client()
+        url = self._entity_url('media')
+        with open(file_path, 'rb') as f:
+            r = self.client.post(url, files={'file': f})
+        try:
+            body = r.json() if r is not None else {}
+        except (ValueError, AttributeError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        media_id = (body.get('data') or {}).get('id') or body.get('id')
+        return {'id': media_id}
+
 
 class CampaignUpload(object):
     file_name = 'campaign_upload.xlsx'
@@ -540,3 +558,19 @@ class Creative(object):
         found = api.get_id(api.creative_dict, self.name)
         if found:
             self.id = found[0]
+
+
+class CreativeUpload(utl.BaseCreativeStore):
+    """Reddit creative store: filename -> uploaded-media id in
+    ``reddit_creative_ids.csv``, resolved for ad creation. Per-file
+    upload lives on ``RedditApi.upload_creative``; this class is the
+    shared find-new / persist bookkeeping only.
+    """
+    id_cols = ('id',)
+
+    def __init__(self, id_file_name='reddit_creative_ids.csv',
+                 creative_path='creative/'):
+        super().__init__(id_file_name, creative_path)
+
+    def _upload_one(self, api, file_path):
+        return api.upload_creative(file_path)
