@@ -29,6 +29,17 @@ def _apply_row(instance, row):
             logging.warning(f'AttributeError: {e}')
 
 
+def _to_iso(value):
+    """Reddit wants ISO-8601 timestamps; plan-derived flight dates
+    arrive as MM/DD/YYYY strings (or excel datetimes)."""
+    if value is None or value == '':
+        return None
+    try:
+        return pd.to_datetime(value).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except (ValueError, TypeError):
+        return None
+
+
 def _populate_reddit_result(result, response):
     """Fill ``result`` from a Reddit Ads create response. Success:
     ``{"data": {"id": ...}}``. Failure: ``{"errors": [...]}``."""
@@ -180,6 +191,24 @@ class RedditApi(object):
         elif kind == 'creative':
             self.creative_dict = self._list('creatives')
 
+    def get_funding_instruments(self):
+        """Funding instruments on the ad account, labelled by currency
+        when Reddit returns no display name. Feeds the campaign
+        config's ``funding_instrument_id`` picker — the one id every
+        Reddit campaign requires that previously had to be hunted in
+        the Reddit UI."""
+        rows = self._list('funding_instruments')
+        return [{'id': fid,
+                 'name': ((row or {}).get('name')
+                          or (row or {}).get('currency') or fid)}
+                for fid, row in (rows or {}).items()]
+
+    def get_creatives(self):
+        """Creatives on the ad account, for ad-config lookup."""
+        rows = self._list('creatives')
+        return [{'id': cid, 'name': (row or {}).get('name', cid)}
+                for cid, row in (rows or {}).items()]
+
     def upload_creative(self, file_path):
         """Upload a local asset to the ad-account ``media`` endpoint and
         return its media id. Wire format unverified — validate on a
@@ -320,6 +349,8 @@ class AdGroupUpload(object):
     bid_strategy = 'bid_strategy'
     budget_type = 'budget_type'
     budget_value = 'budget_value'
+    start_time = 'start_time'
+    end_time = 'end_time'
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -378,7 +409,7 @@ class AdGroupUpload(object):
 class AdGroup(object):
     __slots__ = ['name', 'campaign', 'campaignId', 'configured_status',
                  'bid_strategy', 'budget_type', 'budget_value',
-                 'upload_dict', 'api', 'id']
+                 'start_time', 'end_time', 'upload_dict', 'api', 'id']
 
     def __init__(self, row_dict, api=None):
         self.id = None
@@ -389,6 +420,8 @@ class AdGroup(object):
         self.bid_strategy = 'AUTOMATIC'
         self.budget_type = 'DAILY'
         self.budget_value = None
+        self.start_time = None
+        self.end_time = None
         _apply_row(self, row_dict)
         self.api = api
         if self.api:
@@ -412,6 +445,11 @@ class AdGroup(object):
         }
         if self.budget_value:
             d['budget_value'] = float(self.budget_value)
+        for col, value in ((AdGroupUpload.start_time, self.start_time),
+                           (AdGroupUpload.end_time, self.end_time)):
+            iso = _to_iso(value)
+            if iso:
+                d[col] = iso
         return d
 
     def check_exists(self, api):

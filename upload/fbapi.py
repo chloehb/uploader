@@ -92,7 +92,20 @@ class FbApi(object):
         time_zone = now.tzname()
         return time_zone
 
+    def has_account(self):
+        """Return True if a usable ad-account id is configured."""
+        act_id = str(self.act_id or '').replace('act_', '').strip()
+        return bool(self.account and act_id)
+
     def set_id_name_dict(self, fb_object, parent_ids=None):
+        if not self.has_account():
+            logging.warning('No Facebook ad-account id configured.  '
+                            'Skipping object lookup.')
+            dict_attr = {Campaign: 'cam_dict', AdSet: 'adset_dict',
+                         Ad: 'ad_dict'}.get(fb_object)
+            if dict_attr:
+                setattr(self, dict_attr, [])
+            return
         if fb_object == Campaign:
             fields = ['id', 'name']
             self.cam_dict = list(self.account.get_campaigns(fields=fields))
@@ -227,6 +240,13 @@ class FbApi(object):
         pixels = self.account.get_ads_pixels(fields=['id', 'name'])
         return [{'id': x['id'], 'name': x.get('name') or x['id']}
                 for x in pixels]
+
+    def get_account_pages(self):
+        """Pages the account can promote as ``[{'id','name'}]`` so the
+        app layer can offer a page picker for adset/ad page ids."""
+        pages = self.account.get_promote_pages(fields=['id', 'name'])
+        return [{'id': x['id'], 'name': x.get('name') or x['id']}
+                for x in pages]
 
     def get_matching_custom_audiences(self, audiences):
         return [a for a in self.get_account_custom_audiences()

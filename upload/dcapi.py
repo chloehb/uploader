@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import time
@@ -12,6 +13,44 @@ dcm_path = 'dcm'
 config_path = os.path.join(utl.config_file_path, dcm_path)
 
 base_url = 'https://www.googleapis.com/dfareporting'
+
+# Extension -> creativeAssets assetIdentifier type. Images cover the
+# standard display path; anything else best-efforts to HTML.
+_ASSET_TYPE_BY_EXT = {
+    '.png': 'HTML_IMAGE', '.jpg': 'HTML_IMAGE', '.jpeg': 'HTML_IMAGE',
+    '.gif': 'HTML_IMAGE', '.html': 'HTML', '.zip': 'HTML',
+}
+
+_SIZE_TOKEN = re.compile(r'(\d{2,4})\s*[xX]\s*(\d{2,4})')
+
+
+def _asset_type_for(file_name):
+    ext = os.path.splitext(str(file_name))[1].lower()
+    return _ASSET_TYPE_BY_EXT.get(ext, 'HTML_IMAGE')
+
+
+def _size_from_name(file_name):
+    """``{'width', 'height'}`` from the ad-ops size token in a creative
+    filename (e.g. ``banner_300x250.jpg``), or ``None`` — DCM can also
+    detect size from the image asset itself."""
+    match = _SIZE_TOKEN.search(str(file_name))
+    if not match:
+        return None
+    return {'width': int(match.group(1)), 'height': int(match.group(2))}
+
+
+def _multipart_related(metadata, media, boundary='lqapp_creative'):
+    """``(body, content_type)`` for a Google ``uploadType=multipart``
+    request: a JSON metadata part plus the media bytes. Built by hand —
+    requests only generates multipart/form-data."""
+    parts = [
+        '--{}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'
+        '{}\r\n'.format(boundary, json.dumps(metadata)).encode(),
+        '--{}\r\nContent-Type: application/octet-stream\r\n\r\n'.format(
+            boundary).encode() + media + b'\r\n',
+        '--{}--\r\n'.format(boundary).encode(),
+    ]
+    return b''.join(parts), 'multipart/related; boundary={}'.format(boundary)
 
 
 def _populate_dcm_result(result, response):
@@ -307,29 +346,68 @@ class DcApi(object):
         sys.exit(0)
 
     def upload_creative(self, file_path, advertiser_id=None):
-        """Upload a local asset to the dfareporting media-upload
-        endpoint and return its id. Wire format unverified — validate
-        on a real account before relying on it in live trafficking.
+        """Insert a creative asset (multipart metadata + media) and
+        wrap it in a DISPLAY creative named after the file, so ads can
+        reference it. Returns ``{'id': creative_id, 'asset_name': ..}``.
+        Wire format documented best-effort — validate on a real account
+        before relying on it in live trafficking.
         """
+        file_name = os.path.basename(file_path)
+        metadata = Asset(file_name, _asset_type_for(file_name)).upload_dict
         upload_base = base_url.replace(
             'www.googleapis.com/dfareporting',
             'www.googleapis.com/upload/dfareporting')
         url = ('{}/v{}/userprofiles/{}/creativeAssets/{}/creativeAssets'
-               '?uploadType=media'.format(
+               '?uploadType=multipart'.format(
                    upload_base, self.version, self.usr_id,
                    advertiser_id or ''))
         self.get_client()
         with open(file_path, 'rb') as f:
-            r = self.client.post(url, data=f.read())
+            body, content_type = _multipart_related(metadata, f.read())
+        r = self.client.post(
+            url, data=body, headers={'Content-Type': content_type})
         try:
-            body = r.json() if r is not None else {}
+            resp = r.json() if r is not None else {}
         except (ValueError, AttributeError):
-            body = {}
-        if not isinstance(body, dict):
-            body = {}
-        asset_id = (body.get('id')
-                    or (body.get('assetIdentifier') or {}).get('name'))
-        return {'id': asset_id}
+            resp = {}
+        if not isinstance(resp, dict):
+            resp = {}
+        asset_ident = (resp.get('assetIdentifier')
+                       or metadata['assetIdentifier'])
+        creative_id = self.create_creative(
+            file_name, asset_ident, advertiser_id,
+            size=_size_from_name(file_name))
+        return {'id': creative_id, 'asset_name': asset_ident.get('name')}
+
+    def create_creative(self, name, asset_identifier, advertiser_id,
+                        size=None):
+        """Insert a DISPLAY creative wrapping an uploaded asset and
+        return its id (``None`` on failure)."""
+        body = {
+            'name': str(name),
+            'type': 'DISPLAY',
+            'active': True,
+            'creativeAssets': [{
+                'assetIdentifier': asset_identifier,
+                'role': 'PRIMARY',
+            }],
+        }
+        if advertiser_id:
+            body['advertiserId'] = int(advertiser_id)
+        if size:
+            body['size'] = size
+        url = self.create_url('creatives')
+        r = self.make_request(url, method='post', body=body)
+        try:
+            resp = r.json() if r is not None else {}
+        except (ValueError, AttributeError):
+            resp = {}
+        if not isinstance(resp, dict) or 'id' not in resp:
+            logging.warning(
+                'Creative {} not created. Response: {}'.format(
+                    name, resp))
+            return None
+        return resp['id']
 
 
 class CampaignUpload(object):
@@ -876,13 +954,50 @@ class AdUpload(object):
     def set_ad(self, ad_id, api=None):
         return Ad(self.config[ad_id], api=api)
 
+    def _advertiser_id_for_ads(self, api):
+        """advertiserId from the first resolvable campaign among this
+        run's ads — ``cam_dict`` rows carry it as the parent field."""
+        if not api.cam_dict:
+            api.set_id_dict(dcm_object='campaign')
+        for a_id in self.config:
+            cam_name = self.config[a_id].get(self.campaign)
+            found = api.get_id(api.cam_dict, cam_name)
+            if found:
+                return (api.cam_dict.get(found[0]) or {}).get(
+                    'advertiserId')
+        return None
+
+    def upload_all_creatives(self, api):
+        """Upload local creative files referenced by the ads' creative
+        column (asset -> DISPLAY creative) before ad creation. Creative
+        names without a matching local file resolve on-platform by name
+        as before. Mirrors ``awapi.AdUpload.upload_all_creatives``."""
+        cu = CreativeUpload()
+        if not self.config:
+            return cu
+        names = {str(row[self.creative]) for row in self.config.values()
+                 if row.get(self.creative)}
+        local = [n for n in names
+                 if os.path.isfile(os.path.join(cu.creative_path, n))]
+        if not local:
+            return cu
+        cu.advertiser_id = self._advertiser_id_for_ads(api)
+        cu.upload_all(api, local)
+        return cu
+
     def upload_all_ads(self, api):
         if not self.config:
             return []
+        cu = self.upload_all_creatives(api)
         total = len(self.config)
         results = []
         for idx, a_id in enumerate(self.config):
             ad = self.set_ad(a_id, api)
+            if not ad.creativeId and ad.creative:
+                # Fresh creatives miss the campaign-scoped listing.
+                ad.creativeId = cu.get_id(str(ad.creative))
+                if ad.creativeId:
+                    ad.upload_dict = ad.create_ad_dict()
             logging.info(
                 f'Uploading ad {idx + 1} of {total}. Ad Name: {ad.name}')
             results.append(self.upload_ad(api, ad))
@@ -1053,8 +1168,8 @@ class Creative(object):
 
 
 class Asset(object):
-    """Creative-asset identifier wrapper. Full multipart asset
-    upload is a follow-up."""
+    """Creative-asset identifier wrapper — the metadata part of the
+    multipart upload in ``DcApi.upload_creative``."""
     name = 'name'
     type = 'asset_type'
 
@@ -1065,7 +1180,7 @@ class Asset(object):
 
     def create_upload_dict(self):
         return {'assetIdentifier': {'name': self.name,
-                                    'type': self.type}}
+                                    'type': self.asset_type}}
 
     def upload(self, api):
         logging.info(f'Uploading asset with {self.upload_dict}')
@@ -1076,16 +1191,19 @@ class Asset(object):
 
 
 class CreativeUpload(utl.BaseCreativeStore):
-    """DCM creative store: filename -> uploaded-asset id in
-    ``dcm_creative_ids.csv``, resolved for ad creation. Per-file
-    upload lives on ``DcApi.upload_creative``; this class is the
-    shared find-new / persist bookkeeping only.
+    """DCM creative store: filename -> inserted CREATIVE id (plus the
+    asset name) in ``dcm_creative_ids.csv``, resolved for ad creation.
+    Per-file upload lives on ``DcApi.upload_creative`` (asset ->
+    DISPLAY creative); this class is the shared find-new / persist
+    bookkeeping only.
     """
-    id_cols = ('id',)
+    id_cols = ('id', 'asset_name')
 
     def __init__(self, id_file_name='dcm_creative_ids.csv',
-                 creative_path='creative/'):
+                 creative_path='creative/', advertiser_id=None):
+        self.advertiser_id = advertiser_id
         super().__init__(id_file_name, creative_path)
 
     def _upload_one(self, api, file_path):
-        return api.upload_creative(file_path)
+        return api.upload_creative(
+            file_path, advertiser_id=self.advertiser_id)
