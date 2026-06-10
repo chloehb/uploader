@@ -200,22 +200,89 @@ class AwApi(object):
         } for x in operand]
         return operation
 
-    def mutate_service(self, service, operand):
+    def mutate_service(self, service, operand, operation='create',
+                       update_mask=None):
         """
-        Makes request to create an object (service) in Google Ads.
+        Makes request to create or update an object (service) in
+        Google Ads.
 
-        :param service: String value of the object to create
-        :param operand: Dictionary of object to create
+        :param service: String value of the object to mutate
+        :param operand: Dictionary of the object
+        :param operation: Mutate operation key ('create' or 'update')
+        :param update_mask: Comma-joined field mask for updates
         :return: Response to the request
         """
         url = self.get_report_url(url_type='/{}'.format(service))
         url = '{}:mutate'.format(url)
-        operand = {'operations': [{'create': operand}]}
+        op = {operation: operand}
+        if update_mask:
+            op['updateMask'] = update_mask
+        operand = {'operations': [op]}
         headers = self.get_client()
         r = self.client.post(url, json=operand, headers=headers)
         if 'error' in r.json():
             logging.warning('Could not upload: {}'.format(r.json()))
         return r
+
+    def probe_account(self):
+        """(ok, message) — one-row GAQL read to verify the customer
+        is reachable, for the live pre-flight checks."""
+        try:
+            r = self.request_report(
+                {'query': 'SELECT customer.id FROM customer LIMIT 1'})
+            body = r.json() if r is not None else {}
+            if isinstance(body, dict) and body.get('error'):
+                err = body['error']
+                return False, str(err.get('message') or err)
+            return True, ''
+        except SystemExit:
+            return False, 'No accessible customer id for this login.'
+        except Exception as e:
+            return False, str(e)
+
+    mutate_services_by_level = {'Campaign': 'campaigns',
+                                'Adset': 'adGroups', 'Ad': 'adGroupAds'}
+
+    def update_statuses(self, object_level, platform_ids, activate=True):
+        """Set ENABLED/PAUSED on existing objects via a mutate update.
+        Ad ids are the adGroupAds resource tail (``adgroupid~adid``).
+        Returns one dict per id: {'platform_id', 'status'
+        ('updated'|'failed'), 'error_code', 'error_message'}."""
+        service = self.mutate_services_by_level.get(object_level)
+        status = 'ENABLED' if activate else 'PAUSED'
+        cid = str(self.client_customer_id or '').replace('-', '')
+        results = []
+        for pid in platform_ids:
+            result = {'platform_id': pid, 'status': 'updated',
+                      'error_code': None, 'error_message': None}
+            if not service:
+                result['status'] = 'failed'
+                result['error_message'] = (
+                    'Unknown Google Ads level: {}'.format(object_level))
+                results.append(result)
+                continue
+            resource = 'customers/{}/{}/{}'.format(cid, service, pid)
+            operand = {'resourceName': resource, 'status': status}
+            try:
+                r = self.mutate_service(
+                    service, operand, operation='update',
+                    update_mask='status')
+                body = r.json() if r is not None else {}
+                if not isinstance(body, dict):
+                    body = body[0] if body else {}
+                err = (body or {}).get('error')
+                if err:
+                    result['status'] = 'failed'
+                    result['error_code'] = (
+                        str(err.get('code', '')) or None)
+                    result['error_message'] = (
+                        err.get('message')
+                        or 'Unknown error from Google Ads')
+            except Exception as e:
+                result['status'] = 'failed'
+                result['error_message'] = str(e)
+            results.append(result)
+        return results
 
     def upload_creative(self, file_path):
         """Upload a local image as a Google Ads image asset

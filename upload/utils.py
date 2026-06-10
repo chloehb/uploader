@@ -17,6 +17,10 @@ def dir_check(directory):
         os.makedirs(directory)
 
 
+class UploaderAuthError(Exception):
+    """Channel credential/refresh failure — fatal, message secret-free."""
+
+
 class BaseCreativeStore(object):
     """Shared filename->platform-id bookkeeping for creative upload.
 

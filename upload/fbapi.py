@@ -97,6 +97,49 @@ class FbApi(object):
         act_id = str(self.act_id or '').replace('act_', '').strip()
         return bool(self.account and act_id)
 
+    def probe_account(self):
+        """(ok, message) — cheapest authenticated account read, for
+        the live pre-flight checks."""
+        try:
+            if not self.has_account():
+                return False, 'No ad-account id configured.'
+            self.account.api_get(fields=['id'])
+            return True, ''
+        except FacebookRequestError as e:
+            return False, str(e.api_error_message())
+        except Exception as e:
+            return False, str(e)
+
+    fb_objects_by_level = {'Campaign': Campaign, 'Adset': AdSet, 'Ad': Ad}
+
+    def update_statuses(self, object_level, platform_ids, activate=True):
+        """Set ACTIVE/PAUSED on existing objects by platform id.
+        Returns one dict per id: {'platform_id', 'status'
+        ('updated'|'failed'), 'error_code', 'error_message'}."""
+        fb_object = self.fb_objects_by_level.get(object_level)
+        status = 'ACTIVE' if activate else 'PAUSED'
+        results = []
+        for pid in platform_ids:
+            result = {'platform_id': pid, 'status': 'updated',
+                      'error_code': None, 'error_message': None}
+            if not fb_object:
+                result['status'] = 'failed'
+                result['error_message'] = (
+                    'Unknown Facebook level: {}'.format(object_level))
+                results.append(result)
+                continue
+            try:
+                fb_object(str(pid)).api_update(params={'status': status})
+            except FacebookRequestError as e:
+                result['status'] = 'failed'
+                result['error_code'] = str(e.api_error_code())
+                result['error_message'] = str(e.api_error_message())
+            except Exception as e:
+                result['status'] = 'failed'
+                result['error_message'] = str(e)
+            results.append(result)
+        return results
+
     def set_id_name_dict(self, fb_object, parent_ids=None):
         if not self.has_account():
             logging.warning('No Facebook ad-account id configured.  '

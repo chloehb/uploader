@@ -9,6 +9,7 @@ import time
 
 import pandas as pd
 import requests
+from oauthlib.oauth2 import OAuth2Error
 from requests_oauthlib import OAuth2Session
 
 import uploader.upload.utils as utl
@@ -119,7 +120,9 @@ class RedditApi(object):
                     f'{item} not in Reddit config file. Aborting.')
                 sys.exit(0)
 
-    def get_client(self):
+    def get_client(self, force=False):
+        if self.client and not force:
+            return
         token = {'access_token': self.access_token,
                  'refresh_token': self.refresh_token,
                  'token_type': 'Bearer',
@@ -128,7 +131,14 @@ class RedditApi(object):
         extra = {'client_id': self.client_id,
                  'client_secret': self.client_secret}
         self.client = OAuth2Session(self.client_id, token=token)
-        token = self.client.refresh_token(self.refresh_url, **extra)
+        try:
+            token = self.client.refresh_token(self.refresh_url, **extra)
+        except OAuth2Error:
+            self.client = None
+            raise utl.UploaderAuthError(
+                'Reddit OAuth refresh failed (401/invalid_grant): '
+                'refresh credentials are invalid or revoked — '
+                're-authorize the app and update redditconfig.json.')
         self.client = OAuth2Session(self.client_id, token=token)
 
     def _entity_url(self, segment):
@@ -151,6 +161,16 @@ class RedditApi(object):
     def _get(self, url, params=None):
         self.get_client()
         return self.client.get(url, params=params or {})
+
+    def _patch(self, url, body=None):
+        self.get_client()
+        try:
+            self.r = self.client.patch(url, json=body or {})
+        except requests.exceptions.SSLError as e:
+            logging.warning(f'Reddit SSLError: {e}')
+            time.sleep(30)
+            self.r = self._patch(url, body=body)
+        return self.r
 
     @staticmethod
     def get_id(dict_o, match, match_name='name'):
@@ -226,6 +246,63 @@ class RedditApi(object):
             body = {}
         media_id = (body.get('data') or {}).get('id') or body.get('id')
         return {'id': media_id}
+
+    def probe_account(self):
+        """(ok, message) — verify the ad account is reachable, for the
+        live pre-flight checks."""
+        try:
+            r = self._get(self._entity_url('funding_instruments'))
+            body = r.json() if r is not None else {}
+            if not isinstance(body, dict):
+                body = {}
+            errs = body.get('errors')
+            if errs:
+                err = (errs[0] or {}) if isinstance(errs, list) else {}
+                return False, str(err.get('message') or errs)
+            return True, ''
+        except Exception as e:
+            return False, str(e)
+
+    entity_segments_by_level = {'Campaign': 'campaigns',
+                                'Adset': 'ad_groups', 'Ad': 'ads'}
+
+    def update_statuses(self, object_level, platform_ids, activate=True):
+        """PATCH ``configured_status`` on existing objects by id.
+        Returns one dict per id: {'platform_id', 'status'
+        ('updated'|'failed'), 'error_code', 'error_message'}."""
+        segment = self.entity_segments_by_level.get(object_level)
+        status = 'ACTIVE' if activate else 'PAUSED'
+        results = []
+        for pid in platform_ids:
+            result = {'platform_id': pid, 'status': 'updated',
+                      'error_code': None, 'error_message': None}
+            if not segment:
+                result['status'] = 'failed'
+                result['error_message'] = (
+                    f'Unknown Reddit level: {object_level}')
+                results.append(result)
+                continue
+            try:
+                url = f'{self._entity_url(segment)}/{pid}'
+                r = self._patch(
+                    url, body={'data': {'configured_status': status}})
+                body = r.json() if r is not None else {}
+                if not isinstance(body, dict):
+                    body = {}
+                errs = body.get('errors') or []
+                if errs:
+                    err = (errs[0] or {}) if isinstance(errs, list) else {}
+                    result['status'] = 'failed'
+                    result['error_code'] = (
+                        str(err.get('code', '')) or None)
+                    result['error_message'] = (
+                        err.get('message')
+                        or 'Unknown error from Reddit Ads')
+            except Exception as e:
+                result['status'] = 'failed'
+                result['error_message'] = str(e)
+            results.append(result)
+        return results
 
 
 class CampaignUpload(object):

@@ -326,6 +326,54 @@ class DcApi(object):
             self.r = self.make_request(url, method, params, body)
         return self.r
 
+    def probe_account(self):
+        """(ok, message) — verify the user profile is reachable, for
+        the live pre-flight checks."""
+        try:
+            r = self.make_request(
+                self.create_url('accountPermissions'), method='get')
+            body = r.json() if r is not None else {}
+            err = (body or {}).get('error')
+            if err:
+                return False, str(err.get('message') or err)
+            return True, ''
+        except Exception as e:
+            return False, str(e)
+
+    def update_statuses(self, object_level, platform_ids, activate=True):
+        """Toggle DCM ads' ``active`` flag. Campaigns and placements
+        have no paused state — Ad is the only level with one. Returns
+        one dict per id: {'platform_id', 'status'
+        ('updated'|'failed'), 'error_code', 'error_message'}."""
+        if object_level != 'Ad':
+            msg = ('DCM {} objects have no paused state — only ads '
+                   'can be toggled.'.format(object_level))
+            return [{'platform_id': pid, 'status': 'failed',
+                     'error_code': None, 'error_message': msg}
+                    for pid in platform_ids]
+        url = self.create_url('ads')
+        results = []
+        for pid in platform_ids:
+            result = {'platform_id': pid, 'status': 'updated',
+                      'error_code': None, 'error_message': None}
+            try:
+                r = self.make_request(
+                    url, method='patch', params={'id': pid},
+                    body={'active': bool(activate)})
+                body = r.json() if r is not None else {}
+                err = (body or {}).get('error')
+                if err:
+                    result['status'] = 'failed'
+                    result['error_code'] = (
+                        str(err.get('code', '')) or None)
+                    result['error_message'] = (
+                        err.get('message') or 'Unknown error from DCM')
+            except Exception as e:
+                result['status'] = 'failed'
+                result['error_message'] = str(e)
+            results.append(result)
+        return results
+
     def raw_request(self, url, method, params=None, body=None):
         if not params:
             params = {}
@@ -334,6 +382,8 @@ class DcApi(object):
                 self.r = self.client.get(url, params=params, json=body)
             elif method == 'post':
                 self.r = self.client.post(url, params=params, json=body)
+            elif method == 'patch':
+                self.r = self.client.patch(url, params=params, json=body)
         else:
             if method == 'get':
                 self.r = self.client.get(url, params=params)
@@ -723,6 +773,12 @@ class PlacementUpload(object):
                 'Campaign {!r} not found in account'.format(
                     placement.campaign))
             return result
+        if not placement.siteId:
+            result['status'] = 'skipped_dep_missing'
+            result['error_message'] = (
+                'Site {!r} not found in DCM (or the site column is '
+                'missing from the upload file)'.format(placement.site))
+            return result
         if placement.check_exists(api):
             existing = api.get_id(api.place_dict, placement.name)
             if existing:
@@ -757,8 +813,11 @@ class Placement(object):
                  'site', 'campaign']
 
     def __init__(self, cam_dict, api=None, upload=True):
-        self.siteId = None
-        self.campaignId = None
+        # Default every slot — a column missing from the upload file
+        # must produce a per-row failure, not an AttributeError that
+        # kills the whole run.
+        for attr in self.__slots__:
+            setattr(self, attr, None)
         self.upload = upload
         for k in cam_dict:
             try:
@@ -803,6 +862,10 @@ class Placement(object):
         return p_dict
 
     def get_site_id(self, api):
+        if not self.site:
+            logging.warning('{} has no site; cannot resolve a site '
+                            'id.'.format(self.name))
+            return
         site = Site({'name': '{}'.format(self.site)}, api=api)
         self.siteId = site.id
 
@@ -1044,15 +1107,16 @@ class AdUpload(object):
 
 class Ad(object):
     __slots__ = ['name', 'campaign', 'campaignId', 'placement',
-                 'placementIds', 'creative', 'creativeId', 'active',
-                 'type', 'startTime', 'endTime', 'upload_dict', 'api',
-                 'upload']
+                 'placementId', 'placementIds', 'creative', 'creativeId',
+                 'active', 'type', 'startTime', 'endTime', 'upload_dict',
+                 'api', 'upload']
 
     def __init__(self, row_dict, api=None, upload=True):
         self.name = None
         self.campaign = None
         self.campaignId = None
         self.placement = None
+        self.placementId = None
         self.placementIds = []
         self.creative = None
         self.creativeId = None
@@ -1074,22 +1138,34 @@ class Ad(object):
             self.upload_dict = self.create_ad_dict()
 
     def resolve_ids(self, api):
-        cam = Campaign({'name': self.campaign}, upload=False)
-        cam.set_id(api)
-        self.campaignId = cam.id
+        if self.campaign:
+            cam = Campaign({'name': self.campaign}, upload=False)
+            cam.set_id(api)
+            self.campaignId = cam.id
         if not self.campaignId:
             return
         if not api.place_dict:
             api.set_id_dict(dcm_object='placement',
                             filter_id=self.campaignId)
+        # DCM convention: the ad is named after its placement.
         placement_names = [
-            p.strip() for p in str(self.placement or '').split('|')
-            if p.strip()]
+            p.strip() for p in str(self.placement or self.name or '')
+            .split('|') if p.strip()]
         self.placementIds = []
         for pname in placement_names:
             pid = api.get_id(api.place_dict, pname)
             if pid:
                 self.placementIds.append(pid[0])
+        if not self.placementIds and self.placementId:
+            for p in str(self.placementId).split('|'):
+                p = p.strip()
+                if not p:
+                    continue
+                try:
+                    self.placementIds.append(int(float(p)))
+                except ValueError:
+                    logging.warning(
+                        f'{self.name}: bad placementId {p!r}')
         if not api.creative_dict:
             api.set_id_dict(dcm_object='creative',
                             filter_id=self.campaignId)
