@@ -8,6 +8,7 @@ import itertools
 import numpy as np
 import pandas as pd
 import datetime as dt
+import decimal
 import upload.utils as utl
 from facebook_business.adobjects.ad import Ad
 from facebook_business.api import FacebookAdsApi
@@ -139,6 +140,108 @@ class FbApi(object):
                 result['error_message'] = str(e)
             results.append(result)
         return results
+
+    def update_object(self, object_level, platform_id, changes,
+                      context=None):
+        """Push whitelisted field edits to one existing object.
+
+        ``changes`` is ``{spreadsheet_column: new_value}`` in row
+        (spreadsheet) space — the same vocabulary the upload files and
+        ``pushed_values`` snapshots carry; this method applies the
+        create path's platform transforms (cent scaling, tz-suffixed
+        datetimes, budget_type-routed budget field). All of an
+        object's edits ride ONE ``api_update`` call, so a partial
+        push can't happen. ``context`` is the object's current file
+        row, consulted for routing values that aren't themselves
+        updatable (``adset_budget_type``).
+
+        :param object_level: 'Campaign' | 'Adset' | 'Ad'.
+        :param platform_id: The platform id to update.
+        :param changes: ``{spreadsheet_column: new_value}``.
+        :param context: Optional current file row dict.
+        :returns: ``{'platform_id', 'status' ('updated'|'failed'),
+            'error_code', 'error_message'}``.
+        """
+        result = {'platform_id': platform_id, 'status': 'updated',
+                  'error_code': None, 'error_message': None}
+        try:
+            fb_object, params = self.update_params(
+                object_level, changes, context)
+            fb_object(str(platform_id)).api_update(params=params)
+        except FacebookRequestError as e:
+            result['status'] = 'failed'
+            result['error_code'] = str(e.api_error_code())
+            result['error_message'] = str(e.api_error_message())
+        except Exception as e:
+            result['status'] = 'failed'
+            result['error_message'] = str(e)
+        return result
+
+    def update_params(self, object_level, changes, context=None):
+        """The whole ``api_update`` payload for one object, built
+        before any call is made so a rejected edit can't leave a
+        partial push behind.
+
+        :param object_level: 'Campaign' | 'Adset' | 'Ad'.
+        :param changes: ``{spreadsheet_column: new_value}``.
+        :param context: Optional current file row dict.
+        :returns: ``(fb_object_class, params)``.
+        :raises ValueError: On an unsupported level, a column outside
+            the update whitelist, an untransformable value, or no
+            changes at all.
+        """
+        fb_object = self.fb_objects_by_level.get(object_level)
+        fields = UPDATE_COLUMN_FIELDS.get(object_level)
+        if not fb_object or not fields:
+            raise ValueError(
+                'No update support for Facebook level: {}'.format(
+                    object_level))
+        params = {}
+        for col, value in (changes or {}).items():
+            if col not in fields:
+                raise ValueError(
+                    'Column not updatable: {}'.format(col))
+            params.update(self.update_param(
+                object_level, col, value, context))
+        if not params:
+            raise ValueError('No changes supplied.')
+        return fb_object, params
+
+    def update_param(self, object_level, col, value, context=None):
+        """``{platform_field: platform_value}`` for one
+        spreadsheet-space edit, mirroring the create path exactly:
+        money x100 to integer cents, datetimes day-bounded then
+        tz-suffixed, the adset budget routed to daily/lifetime via the
+        row's ``adset_budget_type``.
+
+        :param col: Spreadsheet-space column name.
+        :param value: The new value in spreadsheet space.
+        :param context: Optional current file row dict.
+        :returns: One-entry params dict for ``api_update``.
+        :raises ValueError: When the value can't be transformed.
+        """
+        field = UPDATE_COLUMN_FIELDS[object_level][col]
+        if col in MONEY_UPDATE_COLS:
+            cents = money_cents(col, value)
+            if col == AdSetUpload.budget_value:
+                bud_type = str((context or {}).get(
+                    AdSetUpload.budget_type) or '').strip()
+                if bud_type == 'daily':
+                    return {AdSet.Field.daily_budget: cents}
+                if bud_type == 'lifetime':
+                    return {AdSet.Field.lifetime_budget: cents}
+                raise ValueError(
+                    'Unknown adset_budget_type {!r} — cannot route '
+                    'the budget update.'.format(bud_type))
+            return {field: cents}
+        if col in DATE_UPDATE_COLS:
+            v = str(value)
+            if ':' not in v:
+                v = '{} {}'.format(
+                    v, '23:59:59' if col == AdSetUpload.end_time
+                    else '00:00:00')
+            return {field: '{} {}'.format(v, self.tz)}
+        return {field: str(value)}
 
     def set_id_name_dict(self, fb_object, parent_ids=None):
         if not self.has_account():
@@ -1339,6 +1442,62 @@ class AdUpload(object):
             'error_message': o.get('error_message'),
             'pushed_values': self.raw_rows.get(self.ad_key),
         } for o in outcomes]
+
+
+# Spreadsheet-space column -> ``api_update`` field per level, for
+# ``FbApi.update_object``. Defined after the Upload classes so the
+# column vocabulary is spelled once (their constants). The adset
+# budget maps to no fixed field — ``update_param`` routes it to
+# daily/lifetime via the row's ``adset_budget_type``.
+UPDATE_COLUMN_FIELDS = {
+    'Campaign': {
+        CampaignUpload.name: Campaign.Field.name,
+        CampaignUpload.spend_cap: Campaign.Field.spend_cap,
+        CampaignUpload.status: Campaign.Field.status,
+    },
+    'Adset': {
+        AdSetUpload.name: AdSet.Field.name,
+        AdSetUpload.budget_value: None,
+        AdSetUpload.bid: AdSet.Field.bid_amount,
+        AdSetUpload.start_time: AdSet.Field.start_time,
+        AdSetUpload.end_time: AdSet.Field.end_time,
+        AdSetUpload.status: AdSet.Field.status,
+    },
+    'Ad': {
+        AdUpload.name: Ad.Field.name,
+        AdUpload.status: Ad.Field.status,
+    },
+}
+
+# Columns holding dollars in spreadsheet space — pushed as x100 cents.
+MONEY_UPDATE_COLS = (CampaignUpload.spend_cap, AdSetUpload.budget_value,
+                     AdSetUpload.bid)
+
+
+def money_cents(col, value):
+    """Integer cents for a dollars-in-spreadsheet-space amount.
+
+    Decimal, not float: a budget arrives as text or an Excel float,
+    and ``round(19.99 * 100)`` is decided by a binary representation
+    that cannot hold 19.99 exactly. Money going to a live platform
+    rounds half-up on the decimal digits instead, so what the user
+    typed is what gets billed.
+
+    :param col: Spreadsheet-space column name, for the error message.
+    :param value: The amount, as text or a number.
+    :returns: The amount in whole cents.
+    :raises ValueError: When the value is not a number.
+    """
+    try:
+        dollars = decimal.Decimal(str(value).strip().replace(',', ''))
+    except (AttributeError, TypeError, decimal.InvalidOperation):
+        raise ValueError('{} is not a number: {!r}'.format(col, value))
+    return int((dollars * 100).quantize(
+        decimal.Decimal('1'), rounding=decimal.ROUND_HALF_UP))
+
+# Columns holding flight datetimes — day-bounded + tz-suffixed like
+# the create path.
+DATE_UPDATE_COLS = (AdSetUpload.start_time, AdSetUpload.end_time)
 
 
 class Creative(object):
