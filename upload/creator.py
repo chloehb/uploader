@@ -86,13 +86,8 @@ class Job(object):
             mp = MediaPlan(self.file_name, first_row=0)
             df = mp.df
         else:
-            utl.dir_check(file_path)
-            for path_split in ['\\', '/']:
-                if path_split in self.file_name:
-                    new_path = self.file_name.split(path_split)[:-1]
-                    new_path = path_split.join(new_path)
-                    utl.dir_check(new_path)
             file_name = file_path + self.file_name
+            utl.dir_check(os.path.dirname(os.path.abspath(file_name)))
             logging.info('Reading from file: {}'.format(file_name))
             if not os.path.exists(file_name):
                 logging.warning('File does not exist: {}'.format(file_name))
