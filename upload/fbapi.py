@@ -346,17 +346,26 @@ class FbApi(object):
     def target_search(targets_to_search):
         all_targets = []
         for target in targets_to_search[1]:
+            label, marker, selected = str(target).rpartition(' [id:')
+            selected = selected[:-1] if marker and selected[-1:] == ']' else ''
             params = {
-                'q': target,
+                'q': label if selected else target,
                 'type': 'adinterest',
             }
             resp = TargetingSearch.search(params=params)
-            if not resp:
-                logging.warning(target + ' not found in targeting search.  ' +
-                                'It was not added to the adset.')
-                continue
             if targets_to_search[0] == 'interest':
-                resp = [resp[0]]
+                wanted = (selected or str(target)).strip().casefold()
+                resp = [row for row in resp
+                        if wanted == str(row['id']).casefold()
+                        or (not selected
+                            and wanted == str(row['name']).casefold())]
+                if len(resp) != 1:
+                    raise utl.UploaderTargetingError(
+                        f'Interest {target!r} needs one exact platform '
+                        'match. Review targeting before uploading.')
+            if not resp and targets_to_search[0] != 'candidates':
+                raise utl.UploaderTargetingError(
+                    f'Targeting {target!r} could not be resolved.')
             new_tar = [dict((k, x[k]) for k in ('id', 'name')) for x in resp]
             all_targets.extend(new_tar)
         return all_targets
@@ -376,9 +385,16 @@ class FbApi(object):
                 'type': 'adTargetingCategory', 'class': 'behaviors'})
             self._behavior_catalog = [
                 {'id': x['id'], 'name': x['name']} for x in rows or []]
-        hits = (utl.match_name(self._behavior_catalog, name,
-                               'Facebook behaviors') for name in names)
-        return [hit for hit in hits if hit]
+        hits = []
+        for name in names:
+            wanted = str(name).strip().casefold()
+            exact = [row for row in self._behavior_catalog if wanted in (
+                str(row['id']).casefold(), row['name'].casefold())]
+            if len(exact) != 1:
+                raise utl.UploaderTargetingError(
+                    f'Behavior {name!r} needs one exact platform match.')
+            hits.append(exact[0])
+        return hits
 
     @staticmethod
     def get_matching_saved_audiences(audiences):
@@ -492,7 +508,9 @@ class FbApi(object):
             targeting.update(aud_target)
             return targeting
         aud_target = self.get_matching_custom_audiences(audience_id)
-        if not aud_target:
+        wanted_ids = set(map(str, audience_id if isinstance(
+            audience_id, (list, tuple)) else [audience_id]))
+        if wanted_ids - {str(row['id']) for row in aud_target}:
             wanted = audience_id
             if isinstance(wanted, (list, tuple)):
                 wanted = ', '.join(str(x) for x in wanted if x)
@@ -673,14 +691,15 @@ class FbApi(object):
                 found = self.target_search(target)
             elif target[0] == self.interest_exclude:
                 spec = targeting.setdefault(Targeting.Field.exclusions, {})
-                found = self.target_search(['interest-broad', target[1]])
+                found = self.target_search(['interest', target[1]])
             elif target[0] == self.behavior:
                 key = Targeting.Field.behaviors
                 found = self.behavior_search(target[1])
             else:
                 if 'audience' not in target[0]:
-                    logging.warning('Unknown adset_target type %r ignored.',
-                                    target[0])
+                    raise utl.UploaderTargetingError(
+                        f'Unknown targeting type {target[0]!r}. '
+                        'Review targeting before uploading.')
                 continue
             spec[key] = self._merge_by_id(spec.get(key), found)
         return targeting

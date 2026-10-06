@@ -901,9 +901,11 @@ class AdGroup(object):
         names -> Reddit geo ids live; devices/platforms/gender map to the
         v3 enums. Empty when nothing is set (Reddit then runs broad)."""
         targeting = {}
-        communities = [name for name in (
-            normalize_community(value)
-            for value in utl.split_list(self.communities)) if name]
+        communities = [normalize_community(value)
+                       for value in utl.split_list(self.communities)]
+        if not all(communities):
+            raise utl.UploaderTargetingError(
+                'Verify every Reddit community before uploading.')
         if communities:
             targeting['communities'] = communities
         interests = utl.split_list(self.interests)
