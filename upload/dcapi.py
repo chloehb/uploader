@@ -27,6 +27,25 @@ _ASSET_TYPE_BY_EXT = {
 
 _SIZE_TOKEN = re.compile(r'(\d{2,4})\s*[xX]\s*(\d{2,4})')
 
+CAMPAIGN_ID_DICTS = {'placement': 'place_dict', 'ad': 'ad_dict',
+                     'creative': 'creative_dict'}
+
+_LIVE_ENTITIES = {
+    'Campaign': ('campaigns', None, 'advertiserId'),
+    'Adset': ('placements', 'campaignIds', 'campaignId'),
+    'Ad': ('ads', 'placementIds', 'placementAssignments.0.placementId'),
+}
+
+
+def campaign_lookup(api, dcm_object, campaign_id):
+    """``api``'s ``dcm_object`` name lookup for ``campaign_id``, re-listed
+    when another campaign of the run filled it; one set by hand is kept."""
+    attr = CAMPAIGN_ID_DICTS[dcm_object]
+    scope = getattr(api, 'id_dict_scope', {}).get(attr, str(campaign_id))
+    if scope != str(campaign_id) or not getattr(api, attr):
+        api.set_id_dict(dcm_object=dcm_object, filter_id=campaign_id)
+    return getattr(api, attr)
+
 
 def _asset_type_for(file_name):
     ext = os.path.splitext(str(file_name))[1].lower()
@@ -124,6 +143,7 @@ class DcApi(object):
         self.ad_dict = {}
         self.creative_dict = {}
         self.directory_site_dict = {}
+        self.id_dict_scope = {}
         self.df = pd.DataFrame()
         self.r = None
         if self.config_file:
@@ -325,6 +345,8 @@ class DcApi(object):
             resp_entity='ads', request_filter=request_filter)
 
     def set_id_dict(self, dcm_object=None, filter_id=None):
+        if dcm_object in CAMPAIGN_ID_DICTS:
+            self.id_dict_scope[CAMPAIGN_ID_DICTS[dcm_object]] = str(filter_id)
         if dcm_object == 'landing_page':
             self.lp_dict = self.get_lp_id_dict()
         if dcm_object == 'campaign':
@@ -343,6 +365,24 @@ class DcApi(object):
                 campaign_id=filter_id)
         if dcm_object == 'ad':
             self.ad_dict = self.get_ad_id_dict(campaign_id=filter_id)
+
+    def list_recent(self, level, limit=25, parent_ids=None):
+        """The profile's ``level`` objects for the copy-from-account
+        picker: one page by id descending (CM360 sorts by ID or NAME
+        only), then by change time where the rows carry one."""
+        if level not in _LIVE_ENTITIES:
+            return []
+        entity, parent_filter, parent_key = _LIVE_ENTITIES[level]
+        params = {'sortField': 'ID', 'sortOrder': 'DESCENDING',
+                  'maxResults': limit}
+        if parent_ids and parent_filter:
+            params[parent_filter] = [str(x) for x in parent_ids]
+        response = self.make_request(self.create_url(entity), method='get',
+                                     params=params)
+        return utl.recent_rows(
+            utl.response_body(response).get(entity) or [], limit,
+            parent_key=parent_key, created_key='createInfo.time',
+            updated_key='lastModifiedInfo.time')
 
     def create_entity(self, entity, entity_name=''):
         url = self.create_url(entity_name)
@@ -591,6 +631,13 @@ class CampaignUpload(object):
     ed = 'endDate'
     snapshot_cols = [advertiserId, defaultLandingPage, sd, ed]
 
+    @staticmethod
+    def settings_from_live(fields):
+        """The live campaign's advertiser as a level-file cell; the
+        landing page and dates are the plan's."""
+        return utl.live_settings(
+            {CampaignUpload.advertiserId: fields.get('advertiserId')})
+
     def __init__(self, config_file=None):
         self.config_file = config_file
         self.config = None
@@ -801,6 +848,17 @@ class PlacementUpload(object):
     height = 'height'
     snapshot_cols = [site, startDate, endDate, pricingType, compatibility]
 
+    @staticmethod
+    def settings_from_live(fields):
+        """The live placement's compatibility, payment source and first
+        tag format as level-file cells; site, size and pricing are each
+        placement's own."""
+        pu = PlacementUpload
+        return utl.live_settings({
+            pu.compatibility: fields.get('compatibility'),
+            pu.paymentSource: fields.get('paymentSource'),
+            pu.tagFormats: utl.dig(fields, 'tagFormats.0')})
+
     def __init__(self, config_file=None):
         self.config_file = config_file
         self.config = None
@@ -1005,8 +1063,7 @@ class Placement(object):
                 'was not found in account); skipping existence '
                 'check and upload.'.format(self.name, self.campaign))
             return True
-        if not api.place_dict:
-            api.set_id_dict(dcm_object='placement', filter_id=self.campaignId)
+        campaign_lookup(api, 'placement', self.campaignId)
         pid = api.get_id(api.place_dict, self.name)
         if pid:
             logging.warning('{} already in account.  '
@@ -1122,6 +1179,12 @@ class AdUpload(object):
     deliverySchedule = 'deliverySchedule'
     placementAssignments = 'placementAssignments'
     snapshot_cols = [active, type, startTime, endTime, creative]
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live ad's type as a level-file cell; creative,
+        placements, click-through and status are each ad's own."""
+        return utl.live_settings({AdUpload.type: fields.get('type')})
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -1293,9 +1356,7 @@ class Ad(object):
             self.campaignId = cam.id
         if not self.campaignId:
             return
-        if not api.place_dict:
-            api.set_id_dict(dcm_object='placement',
-                            filter_id=self.campaignId)
+        campaign_lookup(api, 'placement', self.campaignId)
         # DCM convention: the ad is named after its placement.
         placement_names = [
             p.strip() for p in str(self.placement or self.name or '')
@@ -1315,9 +1376,7 @@ class Ad(object):
                 except ValueError:
                     logging.warning(
                         f'{self.name}: bad placementId {p!r}')
-        if not api.creative_dict:
-            api.set_id_dict(dcm_object='creative',
-                            filter_id=self.campaignId)
+        campaign_lookup(api, 'creative', self.campaignId)
         if self.creative:
             cre = api.get_id(api.creative_dict, self.creative)
             if cre:
@@ -1400,8 +1459,7 @@ class Ad(object):
     def check_exists(self, api):
         if not self.campaignId:
             return True
-        if not api.ad_dict:
-            api.set_id_dict(dcm_object='ad', filter_id=self.campaignId)
+        campaign_lookup(api, 'ad', self.campaignId)
         aid = api.get_id(api.ad_dict, self.name)
         if aid:
             logging.warning(
@@ -1431,9 +1489,7 @@ class Creative(object):
             self.set_id(self.api)
 
     def set_id(self, api):
-        if not api.creative_dict:
-            api.set_id_dict(dcm_object='creative',
-                            filter_id=self.campaignId)
+        campaign_lookup(api, 'creative', self.campaignId)
         if not self.name:
             return
         cid = api.get_id(api.creative_dict, self.name)
@@ -1496,6 +1552,9 @@ UPDATE_COLUMN_FIELDS = {
         PlacementUpload.endDate: 'endDate',
     },
 }
+
+LIVE_UPLOADS = {'Campaign': CampaignUpload, 'Adset': PlacementUpload,
+                'Ad': AdUpload}
 
 DATE_UPDATE_COLS = frozenset((
     CampaignUpload.sd, CampaignUpload.ed,

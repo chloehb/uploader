@@ -424,6 +424,44 @@ class AwApi(object):
         budget_id = r.json()['results'][0]['resourceName']
         return budget_id
 
+    live_queries = {
+        'Campaign': ('campaign', 'campaign.id', None, 'campaign', None),
+        'Adset': ('ad_group', 'ad_group.id', 'campaign.id', 'adGroup',
+                  'campaign.id'),
+        'Ad': ('ad_group_ad', 'ad_group_ad.ad.id', 'ad_group.id',
+               'adGroupAd.ad', 'adGroup.id'),
+    }
+
+    def list_recent(self, level, limit=25, parent_ids=None):
+        """The account's ``level`` objects for the copy-from-account
+        picker, newest id first: GAQL exposes no change time on these
+        resources, so the rows carry no stamps."""
+        if level not in self.live_queries:
+            return []
+        resource, order, parent_filter, prefix, parent_key = (
+            self.live_queries[level])
+        clauses = [f"{resource}.status != 'REMOVED'"]
+        if parent_ids and parent_filter:
+            ids = [str(x).strip() for x in parent_ids
+                   if str(x).strip().isdigit()]
+            if not ids:
+                return []
+            clauses.append(f"{parent_filter} IN ({', '.join(ids)})")
+        query = (f"SELECT {', '.join(LIVE_UPLOADS[level].live_fields)} "
+                 f"FROM {resource} WHERE {' AND '.join(clauses)} "
+                 f"ORDER BY {order} DESC LIMIT {int(limit)}")
+        try:
+            batches = self.request_report({'query': query}).json()
+        except (ValueError, AttributeError):
+            batches = []
+        if isinstance(batches, dict):
+            batches = [batches]
+        found = [row for batch in batches or [] if isinstance(batch, dict)
+                 for row in batch.get('results') or []]
+        return utl.recent_rows(found, limit, id_key=f'{prefix}.id',
+                               name_key=f'{prefix}.name',
+                               parent_key=parent_key)
+
     def get_campaign_id_dict(self):
         # parent = {'BaseCampaignId': 'baseCampaignId'}
         fields = {'name': 'name'}
@@ -560,6 +598,46 @@ class CampaignUpload(object):
     location = 'location'
     platform = 'platform'
     snapshot_cols = [status, sd, ed, budget, method]
+    live_fields = (
+        'campaign.id', 'campaign.name', 'campaign.advertising_channel_type',
+        'campaign.advertising_channel_sub_type',
+        'campaign.bidding_strategy_type', 'campaign.frequency_caps',
+        'campaign.network_settings.target_google_search',
+        'campaign.network_settings.target_search_network',
+        'campaign.network_settings.target_content_network',
+        'campaign.network_settings.target_partner_search_network',
+        'campaign.network_settings.target_youtube',
+        'campaign.network_settings.target_google_tv_network',
+        'campaign_budget.delivery_method')
+
+    @staticmethod
+    def live_frequency(caps):
+        """The first frequency cap as the ``cap|unit|level|length`` cell
+        ``Campaign.set_freq`` splits; the file holds one cap."""
+        if not caps:
+            return ''
+        key = caps[0].get('key') or {}
+        level = key.get('level') or ''
+        return utl.join_list([caps[0].get('cap', ''),
+                              key.get('timeUnit', ''),
+                              'ADGROUP' if level == 'AD_GROUP' else level,
+                              key.get('timeLength', '')])
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live campaign's settings as level-file cells; name,
+        status, budget, dates and any bid ceiling are not copied."""
+        cu = CampaignUpload
+        cam = fields.get('campaign') or {}
+        networks = cam.get('networkSettings') or {}
+        return utl.live_settings({
+            cu.method: (fields.get('campaignBudget') or {}).get(
+                'deliveryMethod'),
+            cu.freq: cu.live_frequency(cam.get('frequencyCaps')),
+            cu.channel: cam.get('advertisingChannelType'),
+            cu.channel_sub: cam.get('advertisingChannelSubType'),
+            cu.network: utl.join_list(n for n, on in networks.items() if on),
+            cu.strategy: cam.get('biddingStrategyType')})
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -779,6 +857,19 @@ class AdGroupUpload(object):
     affinity = 'affinity'
     in_market = 'in_market'
     snapshot_cols = [status, bid_type, bid_val]
+    live_bid_types = ('cpcBidMicros', 'cpmBidMicros', 'cpvBidMicros')
+    live_fields = ('ad_group.id', 'ad_group.name', 'ad_group.cpc_bid_micros',
+                   'ad_group.cpm_bid_micros', 'ad_group.cpv_bid_micros',
+                   'campaign.id')
+
+    @staticmethod
+    def settings_from_live(fields):
+        """Which bid the live ad group sets, as the ``bid_type`` cell;
+        criteria live on a resource this read does not query."""
+        group = fields.get('adGroup') or {}
+        bid_type = next((key for key in AdGroupUpload.live_bid_types
+                         if group.get(key)), '')
+        return utl.live_settings({AdGroupUpload.bid_type: bid_type})
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -1121,6 +1212,20 @@ class AdUpload(object):
     image = 'image'
     snapshot_cols = [type, headline1, headline2, headline3, description,
                      description2, final_url, display_url]
+    live_fields = ('ad_group_ad.ad.id', 'ad_group_ad.ad.name',
+                   'ad_group_ad.ad.type', 'ad_group.id')
+    live_ad_types = {'EXPANDED_TEXT_AD': 'ExpandedTextAd',
+                     'RESPONSIVE_SEARCH_AD': 'responsiveSearchAd',
+                     'RESPONSIVE_DISPLAY_AD': 'ResponsiveDisplayAd',
+                     'IMAGE_AD': 'ImageAd'}
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live ad's type as ``Ad`` spells ``AdType``, blank for a
+        type the uploader cannot build."""
+        ad = (fields.get('adGroupAd') or {}).get('ad') or {}
+        return utl.live_settings(
+            {AdUpload.type: AdUpload.live_ad_types.get(ad.get('type'))})
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -1341,3 +1446,7 @@ class CreativeUpload(utl.BaseCreativeStore):
             if rec.get(self.reference_id) == reference_id:
                 return rec.get(self.media_id)
         return None
+
+
+LIVE_UPLOADS = {'Campaign': CampaignUpload, 'Adset': AdGroupUpload,
+                'Ad': AdUpload}

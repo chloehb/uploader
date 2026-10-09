@@ -1,6 +1,7 @@
 """Reddit Ads API uploader. Mirrors the awapi/dcapi class shape so
 the relation system, name-create flow, and run telemetry pick it
 up without special-casing."""
+import itertools
 import json
 import logging
 import os
@@ -424,6 +425,30 @@ class RedditApi(object):
             params = {'ad_group_id': filter_id} if filter_id else None
             self.ad_dict = self._list('ads', params=params)
 
+    live_segments = {'Campaign': ('campaigns', None),
+                     'Adset': ('ad_groups', 'campaign_id'),
+                     'Ad': ('ads', 'ad_group_id')}
+
+    def list_recent(self, level, limit=25, parent_ids=None):
+        """The ad account's ``level`` objects for the copy-from-account
+        picker, most recently changed first. The lists take no sort and
+        one parent per request, so each parent's first
+        ``utl.RECENT_SCAN_CAP`` rows are read."""
+        if level not in self.live_segments:
+            return []
+        segment, parent_param = self.live_segments[level]
+        scan = max(limit, utl.RECENT_SCAN_CAP)
+        param_sets = [None]
+        if parent_ids and parent_param:
+            param_sets = [{parent_param: str(x)} for x in parent_ids]
+        url = self._entity_url(segment)
+        found = itertools.chain.from_iterable(
+            itertools.islice(self._paginate(url, params), scan)
+            for params in param_sets)
+        return utl.recent_rows(found, limit, parent_key=parent_param,
+                               created_key='created_at',
+                               updated_key='modified_at')
+
     def _id_name_options(self, segment, *name_keys):
         """``[{'id','name'}]`` for an ad-account list, labelled by the
         first present ``name_keys`` value (else the id) — the shared shape
@@ -675,6 +700,14 @@ class CampaignUpload(utl.BaseUploadConfig):
     spend_cap = 'spend_cap'
     snapshot_cols = [objective, status, funding_instrument_id, spend_cap]
 
+    @staticmethod
+    def settings_from_live(fields):
+        """The live campaign's objective and funding instrument as
+        level-file cells; name, status and spend cap are not copied."""
+        cu = CampaignUpload
+        return utl.live_settings({col: fields.get(col) for col in (
+            cu.objective, cu.funding_instrument_id)})
+
     def upload_all_campaigns(self, api):
         if not self.config:
             return []
@@ -781,6 +814,23 @@ class AdGroupUpload(utl.BaseUploadConfig):
     snapshot_cols = [configured_status, bid_strategy, bid_type, bid_value,
                      goal_type, goal_value, optimization_goal,
                      conversion_pixel_id, start_time, end_time]
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live ad group's bidding, goal and targeting as level-file
+        cells, without name, status, amounts or flight; geolocations stay
+        the geo ids ``create_targeting_dict`` passes through."""
+        agu = AdGroupUpload
+        targeting = fields.get('targeting') or {}
+        values = {col: fields.get(col) for col in (
+            agu.bid_strategy, agu.bid_type, agu.goal_type,
+            agu.optimization_goal, agu.conversion_pixel_id)}
+        values.update({col: utl.join_list(targeting.get(col)) for col in (
+            agu.communities, agu.geolocations, agu.interests, agu.platforms)})
+        values[agu.devices] = utl.join_list(
+            (d or {}).get('type') for d in targeting.get('devices') or [])
+        values[agu.gender] = targeting.get('gender')
+        return utl.live_settings(values)
 
     def upload_all_adgroups(self, api):
         if not self.config:
@@ -962,6 +1012,13 @@ class AdUpload(utl.BaseUploadConfig):
     post_type = 'post_type'
     snapshot_cols = [configured_status, headline, call_to_action,
                      destination_url]
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The profile a live ad posts as, as a level-file cell; the
+        headline and call to action live on the post."""
+        return utl.live_settings(
+            {AdUpload.profile: fields.get('profile_id')})
 
     def upload_all_ads(self, api):
         if not self.config:
@@ -1191,6 +1248,9 @@ UPDATE_COLUMN_FIELDS = {
         AdGroupUpload.end_time: 'end_time',
     },
 }
+
+LIVE_UPLOADS = {'Campaign': CampaignUpload, 'Adset': AdGroupUpload,
+                'Ad': AdUpload}
 
 MONEY_UPDATE_COLS = (CampaignUpload.spend_cap, AdGroupUpload.goal_value,
                      AdGroupUpload.bid_value)

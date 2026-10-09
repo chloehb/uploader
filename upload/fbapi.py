@@ -286,6 +286,37 @@ class FbApi(object):
             self.ad_dict = list(self.account.get_ads(
                 fields=fields, params=params))
 
+    live_edges = {'Campaign': ('get_campaigns', None, None),
+                  'Adset': ('get_ad_sets', 'campaign.id', 'campaign_id'),
+                  'Ad': ('get_ads', 'adset.id', 'adset_id')}
+
+    @staticmethod
+    def _live_dict(obj):
+        """A Marketing API object (or a plain mapping) as a dict."""
+        if hasattr(obj, 'export_all_data'):
+            return dict(obj.export_all_data())
+        return dict(obj)
+
+    def list_recent(self, level, limit=25, parent_ids=None):
+        """The account's ``level`` objects for the copy-from-account
+        picker, most recently changed first. The edges take no sort, so
+        only the first ``utl.RECENT_SCAN_CAP`` objects are read."""
+        if level not in self.live_edges or not self.has_account():
+            return []
+        edge, filter_field, parent_key = self.live_edges[level]
+        scan = max(limit, utl.RECENT_SCAN_CAP)
+        params = {'limit': scan}
+        if parent_ids and filter_field:
+            params['filtering'] = [{
+                'field': filter_field, 'operator': 'IN',
+                'value': [str(x) for x in parent_ids]}]
+        objects = getattr(self.account, edge)(
+            fields=list(LIVE_UPLOADS[level].live_fields), params=params)
+        return utl.recent_rows(
+            (self._live_dict(obj) for obj in itertools.islice(objects, scan)),
+            limit, parent_key=parent_key, created_key='created_time',
+            updated_key='updated_time')
+
     def campaign_to_id(self, campaigns):
         if not self.cam_dict:
             self.set_id_name_dict(Campaign)
@@ -1147,6 +1178,16 @@ class CampaignUpload(object):
     status = 'campaign_status'
     special_ad_cateogry = 'special_ad_category'
     snapshot_cols = [objective, spend_cap, status]
+    live_fields = ('id', 'name', 'objective', 'created_time',
+                   'updated_time')
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live campaign's objective as a level-file cell; the
+        special ad category is not copied as ``create_campaign`` sends
+        NONE."""
+        return utl.live_settings(
+            {CampaignUpload.objective: fields.get('objective')})
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -1240,6 +1281,69 @@ class AdSetUpload(object):
     prom_page = 'adset_page_id'
     snapshot_cols = [budget_type, budget_value, goal, bid, start_time,
                      end_time, status, bill_evt]
+    live_fields = ('id', 'name', 'campaign_id', 'optimization_goal',
+                   'billing_event', 'promoted_object', 'targeting',
+                   'frequency_control_specs', 'daily_budget',
+                   'lifetime_budget', 'created_time', 'updated_time')
+    live_genders = {1: 'M', 2: 'F'}
+
+    @staticmethod
+    def live_target_tokens(targeting):
+        """The ``type::id,id|…`` cell ``load_config`` reads, from a live
+        ad set's audiences, interests, behaviors and exclusions."""
+        spec = (targeting.get('flexible_spec') or [{}])[0]
+        groups = (
+            (FbApi.custom_audience, targeting.get('custom_audiences')),
+            (FbApi.interest_types[0], [*(targeting.get('interests') or []),
+                                       *(spec.get('interests') or [])]),
+            (FbApi.behavior, [*(targeting.get('behaviors') or []),
+                              *(spec.get('behaviors') or [])]),
+            (FbApi.interest_exclude,
+             (targeting.get('exclusions') or {}).get('interests')))
+        tokens = []
+        for kind, items in groups:
+            ids = [str(item['id']) for item in items or [] if item.get('id')]
+            if ids:
+                tokens.append(f"{kind}::{','.join(ids)}")
+        return utl.join_list(tokens)
+
+    @staticmethod
+    def live_goal(fields):
+        """The optimization goal as ``create_adset`` reads it, a REACH
+        goal carrying its frequency cap as ``REACH|days|max``."""
+        goal = fields.get('optimization_goal') or ''
+        for spec in fields.get('frequency_control_specs') or []:
+            if goal == 'REACH' and spec.get('interval_days'):
+                goal = (f"REACH|{spec['interval_days']}|"
+                        f"{spec.get('max_frequency', '')}")
+        return goal
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live ad set's settings as level-file cells, without name,
+        status, amounts or dates; gender only when one is targeted, as
+        blank means both."""
+        asu = AdSetUpload
+        targeting = fields.get('targeting') or {}
+        genders = [asu.live_genders[g] for g in targeting.get('genders') or []
+                   if g in asu.live_genders]
+        budgets = [kind for kind in ('daily', 'lifetime')
+                   if str(fields.get(f'{kind}_budget') or '0') != '0']
+        geo = targeting.get('geo_locations') or {}
+        return utl.live_settings({
+            asu.target: asu.live_target_tokens(targeting),
+            asu.country: utl.join_list(geo.get('countries')),
+            asu.age_min: targeting.get('age_min'),
+            asu.age_max: targeting.get('age_max'),
+            asu.genders: genders[0] if len(genders) == 1 else '',
+            asu.device: utl.join_list(targeting.get('device_platforms')),
+            asu.pubs: utl.join_list(targeting.get('publisher_platforms')),
+            asu.pos: utl.join_list(targeting.get('facebook_positions')),
+            asu.budget_type: budgets[0] if budgets else '',
+            asu.goal: asu.live_goal(fields),
+            asu.bill_evt: fields.get('billing_event'),
+            asu.prom_page: (fields.get('promoted_object') or {}).get(
+                'page_id')})
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -1401,6 +1505,23 @@ class AdUpload(object):
     view_tag = 'view_tag'
     status = 'ad_status'
     snapshot_cols = [status, title, body, desc, cta, link, d_link]
+    live_fields = ('id', 'name', 'adset_id',
+                   'creative{object_story_spec,instagram_actor_id}',
+                   'created_time', 'updated_time')
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live ad's page, Instagram identity and call to action as
+        level-file cells; copy, links and media belong to each ad."""
+        adu = AdUpload
+        creative = fields.get('creative') or {}
+        story = creative.get('object_story_spec') or {}
+        data = story.get('link_data') or story.get('video_data') or {}
+        return utl.live_settings({
+            adu.prom_page: story.get('page_id'),
+            adu.ig_id: (creative.get('instagram_actor_id')
+                        or story.get('instagram_actor_id')),
+            adu.cta: (data.get('call_to_action') or {}).get('type')})
 
     def __init__(self, config_file=None):
         self.config_file = config_file
@@ -1627,6 +1748,9 @@ UPDATE_COLUMN_FIELDS = {
         AdUpload.status: Ad.Field.status,
     },
 }
+
+LIVE_UPLOADS = {'Campaign': CampaignUpload, 'Adset': AdSetUpload,
+                'Ad': AdUpload}
 
 # Columns holding dollars in spreadsheet space — pushed as x100 cents.
 MONEY_UPDATE_COLS = (CampaignUpload.spend_cap, AdSetUpload.budget_value,

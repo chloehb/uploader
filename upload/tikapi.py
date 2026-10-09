@@ -15,6 +15,7 @@ plan supplies pass through verbatim rather than being mapped onto a
 guessed vocabulary; only the defaults are spelled here, each one a
 value the live account actually uses."""
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -139,6 +140,14 @@ def _to_bool(value):
     if isinstance(value, str):
         return value.strip().lower() in ('true', 'yes', '1', 'y')
     return bool(value)
+
+
+def _live_flag(value):
+    """A live boolean as the ``TRUE``/``FALSE`` cell :func:`_to_bool`
+    reads, or '' when absent so it is not copied as off."""
+    if value is None or value == '':
+        return ''
+    return 'TRUE' if _to_bool(value) else 'FALSE'
 
 
 def _extract_error(body):
@@ -397,6 +406,32 @@ class TikApi(object):
             self.set_id_dict(kind, filter_id=filter_id)
         return getattr(self, self.id_dict_attrs[kind])
 
+    live_kinds = {'Campaign': 'campaign', 'Adset': 'adgroup', 'Ad': 'ad'}
+
+    def list_recent(self, level, limit=25, parent_ids=None):
+        """The advertiser's ``level`` objects for the copy-from-account
+        picker, most recently changed first, from the first
+        ``utl.RECENT_SCAN_CAP`` rows. The parent filter is re-applied
+        locally for the reason :meth:`set_id_dict` gives."""
+        kind = self.live_kinds.get(level)
+        if not kind:
+            return []
+        endpoint, id_field, name_field, parent_field, filter_key = (
+            self.list_specs[kind])
+        params = {}
+        wanted = {str(x) for x in parent_ids or []}
+        if wanted and filter_key:
+            params['filtering'] = json.dumps({filter_key: sorted(wanted)})
+        found = itertools.islice(self._list_pages(endpoint, params=params),
+                                 max(limit, utl.RECENT_SCAN_CAP))
+        if wanted and parent_field:
+            found = (row for row in found
+                     if str(row.get(parent_field)) in wanted)
+        return utl.recent_rows(found, limit, id_key=id_field,
+                               name_key=name_field, parent_key=parent_field,
+                               created_key='create_time',
+                               updated_key='modify_time')
+
     def create_entity(self, entity, entity_name='campaign'):
         """POST the entity's ``upload_dict`` to the level's create
         endpoint; the advertiser id rides every write."""
@@ -520,6 +555,17 @@ class CampaignUpload(utl.BaseUploadConfig):
     budget_optimize_on = 'budget_optimize_on'
     snapshot_cols = [objective_type, status, budget_mode, budget,
                      budget_optimize_on]
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live campaign's objective and budget settings as
+        level-file cells; name, status and the amount are not copied."""
+        cu = CampaignUpload
+        return utl.live_settings({
+            cu.objective_type: fields.get('objective_type'),
+            cu.budget_mode: fields.get('budget_mode'),
+            cu.budget_optimize_on: _live_flag(
+                fields.get('budget_optimize_on'))})
 
     def upload_all_campaigns(self, api):
         if not self.config:
@@ -645,6 +691,26 @@ class AdGroupUpload(utl.BaseUploadConfig):
                      billing_event, optimization_goal, pacing, bid_type,
                      bid_price, schedule_type, start_time, end_time,
                      promotion_type, placement_type, dayparting, pixel_id]
+    live_setting_cols = (budget_mode, budget_optimize_on, dayparting,
+                         billing_event, optimization_goal,
+                         optimization_event, pacing, bid_type,
+                         promotion_type, placement_type, placements,
+                         pixel_id, location_ids, age_groups, languages,
+                         interest_category_ids, operating_systems, gender)
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live ad group's settings as level-file cells; name,
+        status, amounts and the schedule (the flight's) are not copied."""
+        agu = AdGroupUpload
+        lists = (agu.placements, agu.location_ids, agu.age_groups,
+                 agu.languages, agu.interest_category_ids,
+                 agu.operating_systems)
+        values = {col: fields.get(col) for col in agu.live_setting_cols}
+        values.update({col: utl.join_list(fields.get(col)) for col in lists})
+        values[agu.budget_optimize_on] = _live_flag(
+            fields.get(agu.budget_optimize_on))
+        return utl.live_settings(values)
 
     def upload_all_adgroups(self, api):
         if not self.config:
@@ -890,6 +956,15 @@ class AdUpload(utl.BaseUploadConfig):
     snapshot_cols = [status, ad_format, ad_text, call_to_action,
                      landing_page_url, display_name, identity_id,
                      identity_type]
+    live_setting_cols = (ad_format, call_to_action, display_name,
+                         identity_id, identity_type)
+
+    @staticmethod
+    def settings_from_live(fields):
+        """The live ad's format, identity and call to action as
+        level-file cells; text, landing page and media are each ad's."""
+        return utl.live_settings({col: fields.get(col)
+                                  for col in AdUpload.live_setting_cols})
 
     def creative_filenames(self):
         """Creative filenames referenced by the config, de-duped."""
@@ -1048,3 +1123,7 @@ class Ad(object):
             logging.warning(f'{self.name} already in account.')
             return True
         return False
+
+
+LIVE_UPLOADS = {'Campaign': CampaignUpload, 'Adset': AdGroupUpload,
+                'Ad': AdUpload}

@@ -87,6 +87,69 @@ def snapshot_values(row, columns):
     return snap
 
 
+RECENT_SCAN_CAP = 200
+
+
+def join_list(values):
+    """``|``-join the non-blank values, the inverse of :func:`split_list`."""
+    return '|'.join(str(v) for v in (values or [])
+                    if v is not None and str(v) != '')
+
+
+def dig(row, path):
+    """``row['a']['b']`` for ``path`` ``'a.b'``, where a numeric step
+    indexes a list; None when any step is missing."""
+    value = row
+    for key in str(path or '').split('.'):
+        if isinstance(value, list) and key.isdigit():
+            value = value[int(key)] if int(key) < len(value) else None
+        elif isinstance(value, dict):
+            value = value.get(key)
+        else:
+            return None
+    return value
+
+
+def live_stamp(value):
+    """A platform timestamp (ISO with an offset, epoch milliseconds or
+    ``YYYY-MM-DD hh:mm:ss``) as a sortable UTC ISO string, else None."""
+    text = '' if value is None else str(value).strip()
+    if not text:
+        return None
+    try:
+        stamp = (pd.to_datetime(int(text), unit='ms', utc=True)
+                 if text.isdigit() else pd.to_datetime(text, utc=True))
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return None if pd.isna(stamp) else stamp.isoformat()
+
+
+def recent_rows(objects, limit, id_key='id', name_key='name',
+                parent_key=None, created_key=None, updated_key=None):
+    """``list_recent``'s answer: each object as ``{'id', 'name',
+    'parent_id', 'created', 'updated', 'fields'}`` read along :func:`dig`
+    paths, the ``limit`` most recently changed first."""
+    rows = []
+    for obj in objects:
+        fields = dict(obj or {})
+        parent = dig(fields, parent_key)
+        rows.append({'id': str(dig(fields, id_key) or ''),
+                     'name': str(dig(fields, name_key) or ''),
+                     'parent_id': str(parent) if parent else None,
+                     'created': live_stamp(dig(fields, created_key)),
+                     'updated': live_stamp(dig(fields, updated_key)),
+                     'fields': fields})
+    rows.sort(key=lambda r: r['updated'] or r['created'] or '', reverse=True)
+    return rows[:limit]
+
+
+def live_settings(values):
+    """``values`` as level-file cells without the blanks, so a copied
+    setting never overwrites a cell the uploader already holds."""
+    return {col: str(val) for col, val in values.items()
+            if val is not None and str(val).strip() != ''}
+
+
 def response_body(response):
     """Parse an API response into a dict; unwrap one-item lists."""
     try:
